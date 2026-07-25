@@ -7,7 +7,7 @@ This skill is distributed as a directory. Install it by symlinking (or copying) 
 Keep one canonical copy, for example:
 
 ```bash
-git clone <this-repo> ~/.ai-skills/swarm/skills/frappe-multihand
+git clone https://github.com/esafwan/frappe-multihand.git ~/.ai-skills/swarm/skills/frappe-multihand
 # or
 cp -R ./frappe-multihand ~/.ai-skills/swarm/skills/frappe-multihand
 ```

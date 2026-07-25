@@ -1,6 +1,10 @@
 # frappe-multihand
 
-A skill for safely running **multiple Frappe/ERPNext benches** on a single Docker host with shared MariaDB and Redis services, so developers and AI agents can do parallel feature work without colliding. Think of it as giving your Frappe setup **many hands** — one stable golden bench plus as many disposable benches as you need.
+> Give your Frappe development **many hands** — one stable golden bench plus as many disposable benches as you need, all sharing one Docker MariaDB/Redis stack.
+
+A skill for safely running **multiple Frappe/ERPNext benches** on a single Docker host with shared MariaDB and Redis services, so developers and AI agents can do parallel feature work without colliding.
+
+**Repo:** https://github.com/esafwan/frappe-multihand
 
 ## Why this exists
 
