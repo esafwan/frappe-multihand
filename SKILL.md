@@ -30,20 +30,26 @@ metadata:
 
 ## 1. When to use this skill
 
-Use this skill when you need more than one Frappe/ERPNext bench on a single Docker host that already runs shared MariaDB and Redis containers (e.g. a devcontainer, CI runner, or local development server). Typical reasons:
+Use this skill when you need more than one Frappe/ERPNext bench on a single Docker host that already runs shared MariaDB and Redis containers (e.g. a devcontainer, CI runner, or local development server).
 
-- Test a feature branch in isolation while keeping a stable reference bench usable.
+### Core use case: agentic parallel development
+
+The primary audience is **teams running multiple AI coding agents on the same Frappe codebase**. Each agent works on a different PR, feature, or bugfix in parallel and needs its own **live bench** for browser-level testing, `bench start`, `bench migrate`, `bench console`, and `bench test`.
+
+Typical reasons:
+
+- **Agent A** tests `feature/auth-refactor` on port 8081 while **Agent B** tests `fix/invoice-calc` on port 8082 — both with live sites, real databases, and browser automation.
 - Run parallel CI jobs that each need a full bench with real `bench start`.
-- Let multiple agents work on the same app in separate worktrees without fighting over ports, DB names, or Redis keys.
 - Reproduce a bug against a copy of production data while development continues elsewhere.
+- Keep a stable reference bench untouched as a baseline for comparisons and backups.
 
 Do **not** use this for production multi-tenancy. Disposable benches are intentionally short-lived and co-located; the isolation model is pragmatic, not hardened.
 
 ---
 
-## 2. First-run detection and golden-bench selection
+## 2. First-run detection and reference-bench selection
 
-Before doing anything else, the skill must determine whether a bench environment already exists and, if so, which bench is the **golden bench**.
+Before doing anything else, the skill must determine whether a bench environment already exists and, if so, which bench is the **reference bench**.
 
 ### 2.1 Detect an existing environment
 
@@ -73,15 +79,15 @@ Look for the following signals (in order):
 
 ### 2.2 Confirm with the user
 
-If benches are found, present them to the user and ask which is the golden bench. Example:
+If benches are found, present them to the user and ask which is the reference bench. Example:
 
 > I found the following benches:
 > - `frappe-bench` (sites: `site-a.local`, `site-b.local`)
 > - `development/16` (sites: `main.local`)
 >
-> Which should be the golden bench (never mutated, source of truth for backups)?
+> Which should be the reference bench (never mutated, source of truth for backups)?
 
-Only after explicit confirmation should the skill mark a bench as golden in the registry.
+Only after explicit confirmation should the skill mark a bench as the reference bench in the registry.
 
 ### 2.3 No environment found
 
@@ -100,7 +106,7 @@ If no bench environment is detected, do **not** silently create one. Options:
 
 2. **Stop and ask for the environment** if bootstrapping is out of scope for the current session.
 
-Never assume a golden bench exists without confirmation.
+Never assume a reference bench exists without confirmation.
 
 ---
 
@@ -117,15 +123,15 @@ Each disposable bench is a full, independent `bench init`. It owns:
 
 The bench lives in a dedicated directory under a **bench root**, e.g. `${BENCH_ROOT}/<bench-name>/`.
 
-### 3.2 Golden bench
+### 3.2 Reference bench
 
-Maintain one **golden bench** that is always stable and never mutated. It is the source of truth for:
+Maintain one **reference bench** that is always stable and never mutated. It is the source of truth for:
 
 - a known-good site backup (`bench backup --with-files`),
 - reference app versions,
 - reference site config values.
 
-Name it unmistakably (e.g. `golden`, `main`, `stable`). Every teardown and provisioning script must refuse to operate on the golden bench.
+Name it unmistakably (e.g. `reference`, `main`, `stable`). Every teardown and provisioning script must refuse to operate on the reference bench.
 
 ### 3.3 Shared services
 
@@ -191,7 +197,7 @@ bench --site ${SITE_NAME} set-config encryption_key "${ENCRYPTION_KEY}"
 
 Before creating resources, verify:
 
-1. Bench name is not the golden-bench name.
+1. Bench name is not the reference-bench name.
 2. The intended `(webserver_port, socketio_port, file_watcher_port)` tuple is not already reserved in the registry or in use on the host.
 3. Redis DB indexes for cache/queue/socketio are not already reserved in the registry.
 4. The registry lock file is free.
@@ -295,19 +301,19 @@ bench --site "${SITE_NAME}" install-app "${APP_NAME}"
 # 8. Mark registry status "ready" and run health check.
 ```
 
-### 4.5 Restore-from-golden mode
+### 4.5 Restore-from-reference mode
 
-Use this when you need realistic data from the golden bench.
+Use this when you need realistic data from the reference bench.
 
-#### 4.5.1 Create the backup in the golden bench first
+#### 4.5.1 Create the backup in the reference bench first
 
-From the golden bench directory, run:
+From the reference bench directory, run:
 
 ```bash
-bench --site "${GOLDEN_SITE}" backup --with-files
+bench --site "${REFERENCE_SITE}" backup --with-files
 ```
 
-This produces SQL + public/private file archives in `sites/${GOLDEN_SITE}/private/backups/`.
+This produces SQL + public/private file archives in `sites/${REFERENCE_SITE}/private/backups/`.
 
 #### 4.5.2 Provision an empty bench, then restore
 
@@ -322,15 +328,15 @@ bench --site "${SITE_NAME}" \
 
 #### 4.5.3 Encryption-key gotcha (critical)
 
-After restore, copy the golden site's `encryption_key` into the new site's `site_config.json`. Without this, encrypted fields, passwords, and secrets will fail at runtime.
+After restore, copy the reference site's `encryption_key` into the new site's `site_config.json`. Without this, encrypted fields, passwords, and secrets will fail at runtime.
 
 ```bash
-# Read the key from the golden site's config file to avoid bench CLI differences.
-# GOLDEN_BENCH_DIR is the path to the golden bench (e.g. ${BENCH_ROOT}/golden).
-GOLDEN_KEY=$(grep -o '"encryption_key": *"[^"]*"' \
-  "${GOLDEN_BENCH_DIR}/sites/${GOLDEN_SITE}/site_config.json" \
+# Read the key from the reference site's config file to avoid bench CLI differences.
+# REFERENCE_BENCH_DIR is the path to the reference bench (e.g. ${BENCH_ROOT}/reference).
+REFERENCE_KEY=$(grep -o '"encryption_key": *"[^"]*"' \
+  "${REFERENCE_BENCH_DIR}/sites/${REFERENCE_SITE}/site_config.json" \
   | head -1 | cut -d'"' -f4)
-bench --site "${SITE_NAME}" set-config encryption_key "${GOLDEN_KEY}"
+bench --site "${SITE_NAME}" set-config encryption_key "${REFERENCE_KEY}"
 ```
 
 **Never** pass `--encryption-key` on the same `bench restore` command as `--with-public-files` or `--with-private-files`. Frappe rejects that combination; it is a known CLI limitation. Always restore first, then set the key.
@@ -370,7 +376,7 @@ Define a configurable range, for example:
 
 | Bench | webserver_port | socketio_port | file_watcher_port | redis_cache_db | redis_queue_db | redis_socketio_db |
 |-------|----------------|---------------|-------------------|----------------|----------------|-------------------|
-| golden | 8080 | 9000 | 6787 | 0 | 0 | 0 |
+| reference | 8080 | 9000 | 6787 | 0 | 0 | 0 |
 | disposable-1 | 8081 | 9001 | 6788 | 1 | 1 | 1 |
 | disposable-2 | 8082 | 9002 | 6789 | 2 | 2 | 2 |
 
@@ -489,13 +495,13 @@ If provisioning fails after the registry intent record is written, teardown must
 
 Therefore the same teardown script can be invoked both for normal teardown and for rollback. Mark the registry status `failed` during rollback so audit can report it.
 
-### 6.3 Golden bench guard
+### 6.3 Reference bench guard
 
-Every teardown command must immediately exit if the target matches the golden bench name. Hard-code the guard:
+Every teardown command must immediately exit if the target matches the reference bench name. Hard-code the guard:
 
 ```bash
-if [ "${BENCH_NAME}" == "${GOLDEN_BENCH_NAME}" ]; then
-  echo "REFUSING to teardown the golden bench: ${BENCH_NAME}" >&2
+if [ "${BENCH_NAME}" == "${REFERENCE_BENCH_NAME}" ]; then
+  echo "REFUSING to teardown the reference bench: ${BENCH_NAME}" >&2
   exit 1
 fi
 ```
@@ -548,8 +554,8 @@ If a DB index has keys but no registry entry uses that index, it is orphaned.
 
 ### 8.1 Absolute guards
 
-1. **Never teardown the golden bench.** Hard-code and test the guard.
-2. **Never mutate the golden bench's database or Redis keys.** Read-only backups only.
+1. **Never teardown the reference bench.** Hard-code and test the guard.
+2. **Never mutate the reference bench's database or Redis keys.** Read-only backups only.
 3. **Never run `redis-cli flushall`.** Always use `FLUSHDB` on the specific DB index.
 4. **Never reuse a Redis DB index** that is already allocated to another bench.
 5. **Never reuse a port tuple** without verifying it is free.
@@ -561,7 +567,7 @@ Using the same Redis instance with DB indexes for `redis_queue` does **not** ful
 Mitigations:
 
 - Use a dedicated Redis instance for queues if benches run workers/scheduler.
-- Or run workers only in the golden/stable bench and use disposable benches for web/API testing only.
+- Or run workers only in the reference/stable bench and use disposable benches for web/API testing only.
 - If disposable benches must run workers, clear their queue DB immediately after teardown.
 
 ### 8.3 Port publishing
@@ -612,13 +618,13 @@ A teardown script should:
 
 The `examples/` directory contains template scripts you can adapt:
 
-- `provision.sh` — create a disposable bench (supports `--from-golden`, `--dry-run`).
+- `provision.sh` — create a disposable bench (supports `--from-reference`, `--dry-run`).
 - `teardown.sh` — remove a disposable bench and release resources.
 - `list.sh` — list registered benches.
 - `audit.sh` — reconcile registry vs reality, with optional `--fix`.
 - `cleanup-orphans.sh` — convenience wrapper around `audit.sh --fix`.
 - `docker-compose.yml` — minimal shared-services compose file.
-- `registry.json` — sample registry with one golden and one disposable bench.
+- `registry.json` — sample registry with one reference and one disposable bench.
 
 Every destructive script should support `--dry-run` (or `--plan`) that prints what it would do without doing it.
 
@@ -627,9 +633,9 @@ Configuration points you must set before using the templates:
 | Variable | Example | Meaning |
 |----------|---------|---------|
 | `BENCH_ROOT` | `/opt/benches` | Parent directory for all benches |
-| `GOLDEN_BENCH_NAME` | `golden` | Name of the protected golden bench |
-| `GOLDEN_BENCH_DIR` | `${BENCH_ROOT}/${GOLDEN_BENCH_NAME}` | Path to golden bench |
-| `GOLDEN_SITE` | `main.local` | Primary site in the golden bench |
+| `REFERENCE_BENCH_NAME` | `reference` | Name of the protected reference bench |
+| `REFERENCE_BENCH_DIR` | `${BENCH_ROOT}/${REFERENCE_BENCH_NAME}` | Path to reference bench |
+| `REFERENCE_SITE` | `main.local` | Primary site in the reference bench |
 | `DB_ROOT_PASSWORD` | `secret` | MariaDB root password |
 | `WEBSERVER_BASE_PORT` | `8080` | Base for disposable webserver ports |
 | `SOCKETIO_BASE_PORT` | `9000` | Base for disposable socketio ports |
@@ -670,18 +676,18 @@ Even with optimizations, each disposable bench should still have its own `sites/
 | Task | Safe command | Unsafe alternative |
 |------|--------------|--------------------|
 | Stop one bench's cache | `redis-cli -h redis -n ${DB} FLUSHDB` | `redis-cli FLUSHALL` |
-| Drop a bench DB | `DROP DATABASE IF EXISTS \`${DB_NAME}\`;` | dropping `*` or the golden DB |
+| Drop a bench DB | `DROP DATABASE IF EXISTS \`${DB_NAME}\`;` | dropping `*` or the reference DB |
 | Create DB user | `CREATE USER ... IDENTIFIED BY ...; GRANT ALL ON \`${DB_NAME}\`.*` | `GRANT ALL ON *.*` |
 | Restore with files | restore first, then `set-config encryption_key` | `--encryption-key` + `--with-public-files` |
 | Allocate resources | locked registry read + write | unguarded read-modify-write |
-| Teardown | check bench name != golden first | deleting golden bench |
+| Teardown | check bench name != reference first | deleting reference bench |
 | Health check | `curl http://127.0.0.1:${PORT}/api/method/ping` | assuming ready after `bench start` |
 
 ---
 
 ## 13. Summary
 
-Use one disposable `bench init` per branch/worktree, with a protected golden bench for reference data. Share MariaDB and Redis containers across benches, but isolate each bench by:
+Use one disposable `bench init` per branch/worktree, with a protected reference bench for reference data. Share MariaDB and Redis containers across benches, but isolate each bench by:
 
 - unique MariaDB user + database,
 - unique Redis DB indexes (or instances),
@@ -689,4 +695,4 @@ Use one disposable `bench init` per branch/worktree, with a protected golden ben
 - a machine-readable, locked registry,
 - idempotent provision/teardown scripts with `--dry-run` support.
 
-Audit regularly. Never `FLUSHALL`. Never touch the golden bench. Always copy the encryption key after restore.
+Audit regularly. Never `FLUSHALL`. Never touch the reference bench. Always copy the encryption key after restore.

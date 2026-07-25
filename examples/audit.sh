@@ -8,7 +8,7 @@ set -euo pipefail
 
 # ==================== CONFIGURATION ====================
 BENCH_ROOT="${BENCH_ROOT:-/opt/benches}"
-GOLDEN_BENCH_NAME="${GOLDEN_BENCH_NAME:-golden}"
+REFERENCE_BENCH_NAME="${REFERENCE_BENCH_NAME:-reference}"
 REGISTRY_FILE="${REGISTRY_FILE:-${BENCH_ROOT}/registry.json}"
 DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD:-change-me}"
 DB_ROOT_USER="${DB_ROOT_USER:-root}"
@@ -113,7 +113,7 @@ for dir in "$BENCH_ROOT"/*; do
   [ -d "$dir" ] || continue
   basename=$(basename "$dir")
   [ "$basename" = ".quarantine" ] && continue
-  [ "$basename" = "$GOLDEN_BENCH_NAME" ] && continue
+  [ "$basename" = "$REFERENCE_BENCH_NAME" ] && continue
   if ! jq -e --arg name "$basename" '.benches[$name]' "$REGISTRY_FILE" >/dev/null 2>&1; then
     report_orphan "directory '$basename' not in registry"
     if [ "$FIX" = true ]; then

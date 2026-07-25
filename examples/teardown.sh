@@ -2,13 +2,13 @@
 # teardown.sh — remove a disposable Frappe bench and release its resources.
 #
 # This is a template. Adapt the configuration block below to your environment.
-# Supports --dry-run. Refuses to touch the golden bench.
+# Supports --dry-run. Refuses to touch the reference bench.
 
 set -euo pipefail
 
 # ==================== CONFIGURATION ====================
 BENCH_ROOT="${BENCH_ROOT:-/opt/benches}"
-GOLDEN_BENCH_NAME="${GOLDEN_BENCH_NAME:-golden}"
+REFERENCE_BENCH_NAME="${REFERENCE_BENCH_NAME:-reference}"
 REGISTRY_FILE="${REGISTRY_FILE:-${BENCH_ROOT}/registry.json}"
 DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD:-change-me}"
 DB_ROOT_USER="${DB_ROOT_USER:-root}"
@@ -42,8 +42,8 @@ done
 
 [ -z "$NAME" ] && { echo "ERROR: --name is required" >&2; usage; exit 1; }
 
-if [ "$NAME" = "$GOLDEN_BENCH_NAME" ]; then
-  echo "ERROR: refusing to teardown the golden bench '$GOLDEN_BENCH_NAME'" >&2
+if [ "$NAME" = "$REFERENCE_BENCH_NAME" ]; then
+  echo "ERROR: refusing to teardown the reference bench '$REFERENCE_BENCH_NAME'" >&2
   exit 1
 fi
 

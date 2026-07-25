@@ -2,7 +2,7 @@
 
 ## Overview
 
-The model separates **shared infrastructure** from **disposable benches**.
+The model separates **shared infrastructure** from **disposable benches**. It is designed for **agentic parallel development**: multiple AI agents or developers working on multiple PRs/features at the same time, each with a live bench for browser-level testing.
 
 ```mermaid
 flowchart TB
@@ -13,7 +13,7 @@ flowchart TB
         end
 
         subgraph Benches["Benches"]
-            Golden["Golden Bench<br/>(stable, never mutated)"]
+            Reference["Reference Bench<br/>(stable, never mutated)"]
             D1["Disposable Bench 1<br/>feature/x"]
             D2["Disposable Bench 2<br/>feature/y"]
             D3["Disposable Bench 3<br/>PR #123"]
@@ -21,8 +21,8 @@ flowchart TB
 
         Registry["Registry<br/>registry.json"]
 
-        Golden --> MariaDB
-        Golden --> Redis
+        Reference --> MariaDB
+        Reference --> Redis
         D1 --> MariaDB
         D1 --> Redis
         D2 --> MariaDB
@@ -30,7 +30,7 @@ flowchart TB
         D3 --> MariaDB
         D3 --> Redis
 
-        Registry -.tracks.-> Golden
+        Registry -.tracks.-> Reference
         Registry -.tracks.-> D1
         Registry -.tracks.-> D2
         Registry -.tracks.-> D3
@@ -43,10 +43,10 @@ flowchart TB
 
 ## Key components
 
-### Golden bench
+### Reference bench
 
 - Long-lived, stable, **never mutated**.
-- Source of backups for restore-from-golden disposable benches.
+- Source of backups for restore-from-reference disposable benches.
 - Protected by a hard-coded guard in every script.
 
 ### Disposable benches
@@ -103,15 +103,15 @@ sequenceDiagram
 
     Skill->>Docker: Detect existing benches
     alt benches found
-        Skill->>User: Present candidates, ask for golden bench
-        User->>Skill: Confirm golden bench
-        Skill->>Registry: Mark golden bench
+        Skill->>User: Present candidates, ask for reference bench
+        User->>Skill: Confirm reference bench
+        Skill->>Registry: Mark reference bench
     else no benches
         Skill->>User: No environment found
         User->>Skill: Choose bootstrap or abort
         opt bootstrap
             Skill->>Docker: Clone frappe_docker, start services
-            Skill->>Registry: Mark new bench as golden
+            Skill->>Registry: Mark new bench as reference
         end
     end
 ```

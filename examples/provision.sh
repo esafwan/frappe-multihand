@@ -2,15 +2,15 @@
 # provision.sh — create a disposable Frappe bench.
 #
 # This is a template. Adapt the configuration block below to your environment.
-# Supports: fresh empty site, restore from golden bench, --dry-run.
+# Supports: fresh empty site, restore from reference bench, --dry-run.
 
 set -euo pipefail
 
 # ==================== CONFIGURATION ====================
 BENCH_ROOT="${BENCH_ROOT:-/opt/benches}"
-GOLDEN_BENCH_NAME="${GOLDEN_BENCH_NAME:-golden}"
-GOLDEN_BENCH_DIR="${GOLDEN_BENCH_DIR:-${BENCH_ROOT}/${GOLDEN_BENCH_NAME}}"
-GOLDEN_SITE="${GOLDEN_SITE:-main.local}"
+REFERENCE_BENCH_NAME="${REFERENCE_BENCH_NAME:-reference}"
+REFERENCE_BENCH_DIR="${REFERENCE_BENCH_DIR:-${BENCH_ROOT}/${REFERENCE_BENCH_NAME}}"
+REFERENCE_SITE="${REFERENCE_SITE:-main.local}"
 REGISTRY_FILE="${REGISTRY_FILE:-${BENCH_ROOT}/registry.json}"
 DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD:-change-me}"
 DB_ROOT_USER="${DB_ROOT_USER:-root}"
@@ -24,7 +24,7 @@ APP_NAME="${APP_NAME:-}"
 FRAPPE_BRANCH="${FRAPPE_BRANCH:-version-15}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-admin}"
 DRY_RUN=false
-FROM_GOLDEN=false
+FROM_REFERENCE=false
 # =======================================================
 
 usage() {
@@ -36,7 +36,7 @@ Options:
   --branch <branch>    Git branch to checkout (required)
   --worktree <path>    Local worktree path (default: clone from APP_REPO)
   --app <app-name>     Frappe app name (default: APP_NAME env var)
-  --from-golden        Restore data from golden bench instead of empty site
+  --from-reference     Restore data from reference bench instead of empty site
   --dry-run            Print actions without executing
   --help               Show this help
 EOF
@@ -56,7 +56,7 @@ while [ $# -gt 0 ]; do
     --branch) BRANCH="$2"; shift 2 ;;
     --worktree) WORKTREE="$2"; shift 2 ;;
     --app) APP="$2"; shift 2 ;;
-    --from-golden) FROM_GOLDEN=true; shift ;;
+    --from-reference) FROM_REFERENCE=true; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
     --help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
@@ -68,8 +68,8 @@ done
 APP="${APP:-$APP_NAME}"
 [ -z "$APP" ] && { echo "ERROR: --app or APP_NAME is required" >&2; usage; exit 1; }
 
-if [ "$NAME" = "$GOLDEN_BENCH_NAME" ]; then
-  echo "ERROR: refusing to provision over golden bench '$GOLDEN_BENCH_NAME'" >&2
+if [ "$NAME" = "$REFERENCE_BENCH_NAME" ]; then
+  echo "ERROR: refusing to provision over reference bench '$REFERENCE_BENCH_NAME'" >&2
   exit 1
 fi
 
@@ -79,7 +79,7 @@ DB_NAME="${NAME//-/_}"
 DB_USER="${NAME//-/_}"
 DB_PASSWORD="$(openssl rand -hex 16)"
 
-# Allocate next index n (0 reserved for golden)
+# Allocate next index n (0 reserved for reference)
 N=1
 while true; do
   WEB_PORT=$((WEBSERVER_BASE_PORT + N))
@@ -113,7 +113,7 @@ flock -x 200
 if [ "$DRY_RUN" = false ]; then
   mkdir -p "$BENCH_ROOT"
   if [ ! -f "$REGISTRY_FILE" ]; then
-    echo '{"version":1,"bench_root":"'"$BENCH_ROOT"'","golden_bench_name":"'"$GOLDEN_BENCH_NAME"'","benches":{}}' > "$REGISTRY_FILE"
+    echo '{"version":1,"bench_root":"'"$BENCH_ROOT"'","reference_bench_name":"'"$REFERENCE_BENCH_NAME"'","benches":{}}' > "$REGISTRY_FILE"
   fi
   TMP=$(mktemp)
   jq --arg name "$NAME" \
@@ -199,13 +199,13 @@ else
     --db-password "$DB_PASSWORD"
 fi
 
-if [ "$FROM_GOLDEN" = true ]; then
-  log "Restoring from golden bench..."
-  # TODO: locate latest backup from golden bench
+if [ "$FROM_REFERENCE" = true ]; then
+  log "Restoring from reference bench..."
+  # TODO: locate latest backup from reference bench
   # dry bench --site "$SITE_NAME" --force restore "$BACKUP_SQL" ...
-  # GOLDEN_KEY=$(grep -o '"encryption_key": *"[^"]*"' "${GOLDEN_BENCH_DIR}/sites/${GOLDEN_SITE}/site_config.json" | head -1 | cut -d'"' -f4)
-  # dry bench --site "$SITE_NAME" set-config encryption_key "$GOLDEN_KEY"
-  log "  (restore-from-golden not fully implemented in template; see SKILL.md)"
+  # REFERENCE_KEY=$(grep -o '"encryption_key": *"[^"]*"' "${REFERENCE_BENCH_DIR}/sites/${REFERENCE_SITE}/site_config.json" | head -1 | cut -d'"' -f4)
+  # dry bench --site "$SITE_NAME" set-config encryption_key "$REFERENCE_KEY"
+  log "  (restore-from-reference not fully implemented in template; see SKILL.md)"
 fi
 
 # Install app

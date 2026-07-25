@@ -1,11 +1,11 @@
 {
   "version": 1,
   "bench_root": "/opt/benches",
-  "golden_bench_name": "golden",
+  "reference_bench_name": "reference",
   "benches": {
-    "golden": {
-      "name": "golden",
-      "path": "/opt/benches/golden",
+    "reference": {
+      "name": "reference",
+      "path": "/opt/benches/reference",
       "site_name": "main.local",
       "branch": "develop",
       "worktree": null,
@@ -21,8 +21,8 @@
         "socketio_db": 0
       },
       "database": {
-        "db_name": "golden_main",
-        "db_user": "golden_main",
+        "db_name": "reference_main",
+        "db_user": "reference_main",
         "db_password": "<redacted>"
       },
       "status": "ready",
