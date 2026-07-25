@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "bench_root": "/opt/benches",
+  "golden_bench_name": "golden",
+  "benches": {
+    "golden": {
+      "name": "golden",
+      "path": "/opt/benches/golden",
+      "site_name": "main.local",
+      "branch": "develop",
+      "worktree": null,
+      "purpose": "Stable reference bench",
+      "ports": {
+        "webserver": 8080,
+        "socketio": 9000,
+        "file_watcher": 6787
+      },
+      "redis": {
+        "cache_db": 0,
+        "queue_db": 0,
+        "socketio_db": 0
+      },
+      "database": {
+        "db_name": "golden_main",
+        "db_user": "golden_main",
+        "db_password": "<redacted>"
+      },
+      "status": "ready",
+      "created_at": "2025-01-01T00:00:00Z",
+      "created_by": "system"
+    },
+    "feature-x-20250725": {
+      "name": "feature-x-20250725",
+      "path": "/opt/benches/feature-x-20250725",
+      "site_name": "feature-x.local",
+      "branch": "feature/x",
+      "worktree": "/opt/worktrees/myapp/feature-x",
+      "purpose": "Test feature/x before PR",
+      "ports": {
+        "webserver": 8081,
+        "socketio": 9001,
+        "file_watcher": 6788
+      },
+      "redis": {
+        "cache_db": 1,
+        "queue_db": 1,
+        "socketio_db": 1
+      },
+      "database": {
+        "db_name": "feature_x_20250725",
+        "db_user": "feature_x_20250725",
+        "db_password": "<redacted>"
+      },
+      "status": "ready",
+      "created_at": "2025-07-25T14:30:00Z",
+      "created_by": "agent-01"
+    }
+  }
+}
