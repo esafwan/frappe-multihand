@@ -25,6 +25,16 @@ metadata:
 - "frappe bench per worktree"
 - "temporary frappe bench in docker"
 - "isolate frappe bench mariadb redis"
+- "/mh-new"
+- "/mh-list"
+- "/mh-testplan"
+- "/mh-teardown"
+- "/mh-audit"
+- "mh new"
+- "mh list"
+- "mh testplan"
+- "mh teardown"
+- "mh audit"
 
 ---
 
@@ -643,6 +653,43 @@ Configuration points you must set before using the templates:
 | `REDIS_HOST` | `redis` | Shared Redis service hostname |
 | `APP_REPO` | `git@github.com:org/app.git` | App repository URL |
 | `APP_NAME` | `myapp` | Frappe app name |
+
+---
+
+## 9a. Helper CLI (`mh`)
+
+The `examples/mh` script is a thin wrapper that provides quick commands for humans and agents. It is intended to be copied into your bench root or added to `PATH`.
+
+### Commands
+
+| Command | What it does |
+|---------|--------------|
+| `mh new <name> --branch <branch> [--app <app>] [--from-reference] [--dry-run]` | Create a disposable bench (wraps `provision.sh`). |
+| `mh list [--json]` | List registered benches (wraps `list.sh`). |
+| `mh testplan <name> [--output <file>]` | Generate a test plan template for a bench. |
+| `mh open <name>` | Open the bench site in the default browser. |
+| `mh logs <name>` | Tail the bench logs. |
+| `mh teardown <name> [--dry-run]` | Remove a disposable bench (wraps `teardown.sh`). |
+| `mh audit [--fix] [--json]` | Reconcile registry vs reality (wraps `audit.sh`). |
+| `mh status` | Quick status of benches (ports, processes). |
+| `mh doctor` | Check environment prerequisites. |
+
+### Slash-command style triggers for agents
+
+When a user types one of the following, treat it as an instruction to run the corresponding `mh` command (or the underlying script if `mh` is not installed):
+
+| Trigger | Action |
+|---------|--------|
+| `/mh-new <name> --branch <branch>` | `mh new <name> --branch <branch>` |
+| `/mh-list` | `mh list` |
+| `/mh-testplan <name>` | `mh testplan <name>` |
+| `/mh-open <name>` | `mh open <name>` |
+| `/mh-teardown <name>` | `mh teardown <name>` |
+| `/mh-audit` | `mh audit` |
+| `/mh-status` | `mh status` |
+| `/mh-doctor` | `mh doctor` |
+
+If `mh` is not on `PATH`, fall back to running the underlying `examples/*.sh` scripts directly with the same arguments.
 
 ---
 

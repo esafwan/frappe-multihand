@@ -45,6 +45,21 @@ Each agent can:
 
 The **registry** keeps track of every bench, so agents don't fight over ports or leave orphaned databases behind. The **reference bench** stays untouched, so there's always a clean baseline to compare against or restore from.
 
+### Slash commands for agents
+
+The `mh` helper also defines slash-command-style triggers that agents can interpret:
+
+- `/mh-new feature-x --branch feature/x` — create a bench
+- `/mh-list` — list benches
+- `/mh-testplan feature-x` — generate a test plan
+- `/mh-open feature-x` — open in browser
+- `/mh-teardown feature-x` — clean up
+- `/mh-audit` — audit registry
+- `/mh-status` — show bench status
+- `/mh-doctor` — check environment
+
+If `mh` is not on `PATH`, agents fall back to the underlying `examples/*.sh` scripts.
+
 ## What you get
 
 | File | Purpose |
@@ -56,6 +71,7 @@ The **registry** keeps track of every bench, so agents don't fight over ports or
 | `examples/provision.sh` | Template script to create a disposable bench. |
 | `examples/teardown.sh` | Template script to remove a disposable bench. |
 | `examples/audit.sh` | Template script to reconcile registry vs reality. |
+| `examples/mh` | Helper CLI: `mh new`, `mh list`, `mh testplan`, `mh open`, `mh teardown`, `mh audit`, `mh status`, `mh doctor`. |
 | `INSTALL.md` | How to install this skill for Kimi, Claude, Codex, OpenCode, Pi, Antigravity, etc. |
 
 ## Quick start
@@ -73,7 +89,13 @@ The **registry** keeps track of every bench, so agents don't fight over ports or
    export WEBSERVER_BASE_PORT=8080
    ```
 
-4. **Create a disposable bench**:
+4. **Create a disposable bench** using the `mh` helper:
+
+   ```bash
+   ./examples/mh new feature-x --branch feature/x --app myapp --from-reference
+   ```
+
+   Or use the underlying script directly:
 
    ```bash
    ./examples/provision.sh \
@@ -86,13 +108,19 @@ The **registry** keeps track of every bench, so agents don't fight over ports or
 5. **Work on it**, then clean up:
 
    ```bash
-   ./examples/teardown.sh --name feature-x
+   ./examples/mh teardown feature-x
    ```
 
 6. **Audit regularly** to catch orphans:
 
    ```bash
-   ./examples/audit.sh --fix
+   ./examples/mh audit --fix
+   ```
+
+7. **Generate a test plan** for the bench:
+
+   ```bash
+   ./examples/mh testplan feature-x --output testplan.md
    ```
 
 ## Adapting to your own Docker setup

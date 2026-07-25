@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# mh — frappe-multihand helper CLI
+#
+# A thin wrapper around provision.sh, teardown.sh, list.sh, and audit.sh.
+# Provides quick commands for humans and agents.
+#
+# Usage:
+#   mh <command> [args]
+#
+# Commands:
+#   new <name> --branch <branch> [--app <app>] [--from-reference] [--dry-run]
+#   list [--json]
+#   testplan <name> [--output <file>]
+#   open <name>
+#   logs <name>
+#   teardown <name> [--dry-run]
+#   audit [--fix] [--json]
+#   status
+#   doctor
+
+set -euo pipefail
+
+# ==================== CONFIGURATION ====================
+BENCH_ROOT="${BENCH_ROOT:-/opt/benches}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROVISION_SCRIPT="${PROVISION_SCRIPT:-${SCRIPT_DIR}/provision.sh}"
+TEARDOWN_SCRIPT="${TEARDOWN_SCRIPT:-${SCRIPT_DIR}/teardown.sh}"
+LIST_SCRIPT="${LIST_SCRIPT:-${SCRIPT_DIR}/list.sh}"
+AUDIT_SCRIPT="${AUDIT_SCRIPT:-${SCRIPT_DIR}/audit.sh}"
+# =======================================================
+
+usage() {
+  cat <<'EOF'
+mh — frappe-multihand helper CLI
+
+Usage: mh <command> [args]
+
+Commands:
+  new <name> --branch <branch> [--app <app>] [--from-reference] [--dry-run]
+      Create a disposable bench.
+
+  list [--json]
+      List registered benches.
+
+  testplan <name> [--output <file>]
+      Generate a test plan template for a bench.
+
+  open <name>
+      Open the bench site in the default browser.
+
+  logs <name>
+      Tail the bench logs.
+
+  teardown <name> [--dry-run]
+      Remove a disposable bench.
+
+  audit [--fix] [--json]
+      Reconcile registry vs reality.
+
+  status
+      Quick status of benches (ports, processes).
+
+  doctor
+      Check environment prerequisites.
+
+EOF
+}
+
+log() { echo "[mh] $*"; }
+
+require_script() {
+  local script="$1"
+  if [ ! -x "$script" ]; then
+    log "ERROR: script not found or not executable: $script" >&2
+    exit 1
+  fi
+}
+
+# --- subcommands ---
+
+cmd_new() {
+  require_script "$PROVISION_SCRIPT"
+  exec "$PROVISION_SCRIPT" "$@"
+}
+
+cmd_list() {
+  require_script "$LIST_SCRIPT"
+  exec "$LIST_SCRIPT" "$@"
+}
+
+cmd_testplan() {
+  local name="" output=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --output) output="$2"; shift 2 ;;
+      --help) echo "Usage: mh testplan <name> [--output <file>]"; exit 0 ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  [ -z "$name" ] && { log "ERROR: bench name required" >&2; exit 1; }
+
+  local site="${name}.local"
+  local plan
+  plan=$(cat <<EOF
+# Test Plan — ${name}
+
+## Bench Info
+- Name: ${name}
+- Site: ${site}
+- URL: http://localhost:<webserver-port>
+- Admin: Administrator / admin
+
+## Smoke Tests
+- [ ] Site responds with HTTP 200 on /api/method/ping
+- [ ] Login page loads
+- [ ] Admin login works
+- [ ] Default site resolves without Host header (if configured)
+
+## Functional Tests
+- [ ] App installs cleanly: \`bench --site ${site} install-app <app>\`
+- [ ] Migrate completes: \`bench --site ${site} migrate\`
+- [ ] Create a test document (ToDo / Note / custom DocType)
+- [ ] Update the document
+- [ ] Delete the document
+- [ ] List view renders
+- [ ] Report/view loads
+
+## API Tests
+- [ ] GET /api/resource/<doctype> returns list
+- [ ] POST /api/resource/<doctype> creates document
+- [ ] Whitelisted method responds
+
+## Background Jobs
+- [ ] Enqueue a test job: \`bench --site ${site} execute frappe.utils.background_jobs.enqueue --kwargs '{"method":"frappe.ping"}'\`
+- [ ] Worker processes the job
+- [ ] Scheduler runs without errors
+
+## Browser / UI Tests
+- [ ] Open http://localhost:<port>/login
+- [ ] Login succeeds
+- [ ] App route loads (e.g. /app, /huf, /desk)
+- [ ] No console errors
+- [ ] Asset 404s absent
+
+## Cleanup
+- [ ] \`mh teardown ${name}\` removes bench, DB, user, and registry entry
+EOF
+)
+
+  if [ -n "$output" ]; then
+    echo "$plan" > "$output"
+    log "Test plan written to $output"
+  else
+    echo "$plan"
+  fi
+}
+
+cmd_open() {
+  local name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --help) echo "Usage: mh open <name>"; exit 0 ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  [ -z "$name" ] && { log "ERROR: bench name required" >&2; exit 1; }
+
+  # Read port from registry if available
+  local port="8080"
+  if [ -f "${BENCH_ROOT}/registry.json" ] && command -v jq >/dev/null 2>&1; then
+    port=$(jq -r --arg name "$name" '.benches[$name].ports.webserver // 8080' "${BENCH_ROOT}/registry.json")
+  fi
+
+  local url="http://localhost:${port}"
+  log "Opening $url"
+  if command -v open >/dev/null 2>&1; then
+    open "$url"
+  elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$url"
+  else
+    log "No browser opener found; visit $url manually"
+  fi
+}
+
+cmd_logs() {
+  local name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --help) echo "Usage: mh logs <name>"; exit 0 ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  [ -z "$name" ] && { log "ERROR: bench name required" >&2; exit 1; }
+
+  local bench_dir="${BENCH_ROOT}/${name}"
+  if [ ! -d "$bench_dir" ]; then
+    log "ERROR: bench directory not found: $bench_dir" >&2
+    exit 1
+  fi
+
+  log "Tailing logs for $name"
+  find "$bench_dir" -name '*.log' -type f 2>/dev/null | head -5 | while read -r logfile; do
+    echo "=== $logfile ==="
+    tail -n 50 "$logfile"
+  done
+}
+
+cmd_teardown() {
+  require_script "$TEARDOWN_SCRIPT"
+  exec "$TEARDOWN_SCRIPT" "$@"
+}
+
+cmd_audit() {
+  require_script "$AUDIT_SCRIPT"
+  exec "$AUDIT_SCRIPT" "$@"
+}
+
+cmd_status() {
+  log "Benches under $BENCH_ROOT:"
+  if [ -f "${BENCH_ROOT}/registry.json" ] && command -v jq >/dev/null 2>&1; then
+    jq -r '.benches[] | [.name, .site_name, .status, .ports.webserver] | @tsv' "${BENCH_ROOT}/registry.json" \
+      | while IFS=$'\t' read -r name site status port; do
+          local proc="stopped"
+          if command -v pgrep >/dev/null 2>&1 && pgrep -f "$BENCH_ROOT/$name" >/dev/null 2>&1; then
+            proc="running"
+          fi
+          printf "  %-24s %-20s %-12s port=%-6s %s\n" "$name" "$site" "$status" "$port" "$proc"
+        done
+  else
+    for dir in "$BENCH_ROOT"/*; do
+      [ -d "$dir" ] || continue
+      basename=$(basename "$dir")
+      local proc="stopped"
+      if command -v pgrep >/dev/null 2>&1 && pgrep -f "$dir" >/dev/null 2>&1; then
+        proc="running"
+      fi
+      echo "  $basename (unregistered) $proc"
+    done
+  fi
+}
+
+cmd_doctor() {
+  log "Checking environment..."
+  local ok=true
+
+  if command -v docker >/dev/null 2>&1; then
+    echo "  docker: $(docker --version | head -1)"
+  else
+    echo "  docker: MISSING"
+    ok=false
+  fi
+
+  if docker ps >/dev/null 2>&1; then
+    echo "  docker daemon: running"
+  else
+    echo "  docker daemon: NOT running"
+    ok=false
+  fi
+
+  if command -v bench >/dev/null 2>&1; then
+    echo "  bench CLI: $(bench --version 2>/dev/null || echo 'found')"
+  else
+    echo "  bench CLI: MISSING (expected inside container, may be OK)"
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    echo "  jq: found"
+  else
+    echo "  jq: MISSING (needed for registry operations)"
+    ok=false
+  fi
+
+  if [ -d "$BENCH_ROOT" ]; then
+    echo "  bench root: $BENCH_ROOT"
+  else
+    echo "  bench root: MISSING ($BENCH_ROOT)"
+    ok=false
+  fi
+
+  if [ "$ok" = true ]; then
+    log "All checks passed"
+  else
+    log "Some checks failed"
+    exit 1
+  fi
+}
+
+# --- dispatch ---
+
+if [ $# -eq 0 ]; then
+  usage
+  exit 1
+fi
+
+CMD="$1"
+shift
+
+case "$CMD" in
+  new) cmd_new "$@" ;;
+  list) cmd_list "$@" ;;
+  testplan) cmd_testplan "$@" ;;
+  open) cmd_open "$@" ;;
+  logs) cmd_logs "$@" ;;
+  teardown) cmd_teardown "$@" ;;
+  audit) cmd_audit "$@" ;;
+  status) cmd_status "$@" ;;
+  doctor) cmd_doctor "$@" ;;
+  --help|-h|help) usage ;;
+  *) log "Unknown command: $CMD" >&2; usage; exit 1 ;;
+esac
