@@ -175,6 +175,12 @@ dry bench set-config -g developer_mode 1
 dry bench set-config -g serve_default_site true
 dry bench set-config -g default_site "$SITE_NAME"
 
+# Socket.io DNS Resolution Fix for Docker containers
+if ! grep -q "$SITE_NAME" /etc/hosts 2>/dev/null; then
+  log "Registering $SITE_NAME in container /etc/hosts for Socket.io authentication..."
+  echo "127.0.0.1 $SITE_NAME" >> /etc/hosts 2>/dev/null || true
+fi
+
 # Create DB/user
 if [ "$DRY_RUN" = false ]; then
   mariadb -h "$MARIADB_HOST" -u "$DB_ROOT_USER" -p"$DB_ROOT_PASSWORD" <<SQL

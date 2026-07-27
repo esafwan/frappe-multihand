@@ -189,6 +189,20 @@ bench set-config -g serve_default_site true
 bench set-config -g default_site "${SITE_NAME}"
 ```
 
+### 3.5 Socket.io authentication & container DNS resolution (Critical)
+
+In containerized Frappe, Socket.io (`apps/frappe/realtime/middlewares/authenticate.js`) verifies socket connections by performing an internal HTTP `fetch` to `http://${SITE_NAME}:${WEBSERVER_PORT}/api/method/frappe.realtime.get_user_info`.
+
+If `${SITE_NAME}` is not registered in the container's `/etc/hosts`, Node's `fetch()` throws `TypeError: fetch failed (UND_ERR_HEADERS_TIMEOUT)`, causing all WebSocket connections to fail with `Unauthorized`.
+
+Always register the site domain inside the container during provisioning:
+```bash
+if ! grep -q "${SITE_NAME}" /etc/hosts 2>/dev/null; then
+  echo "127.0.0.1 ${SITE_NAME}" >> /etc/hosts 2>/dev/null || true
+fi
+```
+
+
 Replace `REDIS_CACHE_DB`, `REDIS_QUEUE_DB`, `REDIS_SOCKETIO_DB` with per-bench Redis DB indexes. The service name `redis` above is illustrative; match the actual service name in your compose file (common alternatives are `redis-cache`, `redis-queue`, `redis-socketio`, or a single `redis`).
 
 Per-site config example:
