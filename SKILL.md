@@ -302,6 +302,18 @@ bench set-config -g socketio_port "${SOCKETIO_PORT}"
 bench set-config -g file_watcher_port "${FILE_WATCHER_PORT}"
 bench set-config -g developer_mode 1
 
+# 4b. `bench start`/`bench serve` reads the port from Procfile's literal
+# `--port N`, NOT from common_site_config.json's webserver_port — the two
+# are independent and `bench init` seeds Procfile with a default (often
+# 8000) that set-config above does not touch. Skipping this step is how two
+# unrelated benches end up serving the same registry-assigned port: one
+# session's Procfile keeps a stale/copy-pasted port literal while its
+# common_site_config.json (and the registry) correctly say otherwise, so
+# whichever bench starts second silently steals the first bench's port.
+# Force them to match immediately after set-config, every time:
+sd '--port \d+' "--port ${WEBSERVER_PORT}" Procfile
+grep -n '^\(web\|socketio\):' Procfile   # confirm both ports before starting
+
 # 5. Create MariaDB user and database.
 # Use `mariadb` (or `mysql` on older images) as the client command.
 mariadb -h mariadb -u root -p"${DB_ROOT_PASSWORD}" <<SQL
@@ -441,6 +453,11 @@ An `audit` or `reconcile` command must cross-check the registry against reality 
 #   - Does ${path} exist?
 #   - Is ${pid} a running process?
 #   - Are the configured ports actually listening?
+#   - Does Procfile's literal `--port N` on the `web:` line match this
+#     entry's registry-assigned webserver_port? (They are independent files —
+#     set-config alone does not update Procfile. A mismatch here means this
+#     bench is not actually serving on its assigned port, and whatever port
+#     it IS serving on may belong to a different registry entry.)
 #   - Does the MariaDB user exist?
 #   - Does the MariaDB database exist?
 #   - Are Redis DB indexes still empty of unexpected keys?
