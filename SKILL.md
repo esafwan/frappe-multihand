@@ -268,10 +268,18 @@ A minimal registry entry (JSON or YAML) must contain:
     "db_password": "<generated>"
   },
   "status": "provisioning",
+  "type": "disposable",
   "created_at": "2025-07-25T14:30:00Z",
-  "created_by": "agent-or-developer-id"
+  "created_by": "claude",
+  "signed_by": "claude",
+  "task_description": "Test feature/x auth changes before PR merge"
 }
 ```
+
+Fields:
+- `type`: `"disposable"` (short-lived, one per branch/PR) or `"persistent"` (long-lived named bench like a develop-testing env).
+- `created_by` / `signed_by`: the agent or human who ran the command — e.g. `"claude"`, `"agy"`, `"codex"`, `"kimi"`, `"human"`. `created_by` is a human-readable label; `signed_by` is machine-readable identity for audit trails.
+- `task_description`: one sentence summarising why this bench was created.
 
 Store the registry in one place, e.g. `${BENCH_ROOT}/registry.json` or `${BENCH_ROOT}/registry.yaml`. Every create/teardown/audit command must go through it.
 
@@ -335,6 +343,7 @@ bench new-site "${SITE_NAME}" \
 bench --site "${SITE_NAME}" install-app "${APP_NAME}"
 
 # 8. Mark registry status "ready" and run health check.
+# 9. Write BENCH_IDENTITY.md to the bench root (see 4.8).
 ```
 
 ### 4.5 Restore-from-reference mode
@@ -421,9 +430,92 @@ Indexes 0–15 are available in a default Redis build. If you expect more than 1
 Allocation algorithm:
 
 1. Load the registry.
-2. Find the smallest integer `n` such that port tuple `(base_web + n, base_socket + n, base_watcher + n)` is unused and `n` is not a reserved Redis DB.
+2. Find the smallest integer `n` such that port tuple `(base_web + n, base_socket + n, base_watcher + n)` is unused in both `benches[]` AND `reserved_ports{}` (see 4.7.1), and `n` is not a reserved Redis DB.
 3. Reserve it atomically under the lock.
 4. Verify on the host that the ports are not already listening (`ss -tlnp` / `lsof -i`) before using them.
+
+### 4.7.1 Reserved port ranges for persistent benches
+
+Persistent benches (e.g. a shared `develop-testing` bench) have stable port assignments that must never be overwritten by the disposable allocator — even when no live registry entry exists for them.
+
+Declare reserved ranges in a `reserved_ports` section of the registry (or in a separate `config.json` at the bench root):
+
+```json
+{
+  "reserved_ports": {
+    "develop-testing": {
+      "webserver": 8001,
+      "socketio": 9001,
+      "file_watcher": 6788,
+      "redis_db": 6,
+      "type": "persistent"
+    }
+  }
+}
+```
+
+The allocator's `N` increment loop must check both `benches[]` entries and `reserved_ports{}` keys for conflicts. If any candidate port or Redis DB appears in either map, skip it.
+
+Persistent benches should also be created with `"type": "persistent"` in their registry entry and must never be torn down by the normal teardown flow (the reference-bench guard pattern applies: check `entry.type == "persistent"` and exit 1).
+
+### 4.8 BENCH_IDENTITY.md
+
+Every bench — disposable and persistent — must have a `BENCH_IDENTITY.md` written to its root directory during provisioning (after the registry is marked `ready`). This file is for any agent or developer who finds the bench directory and needs to understand what it is before touching anything.
+
+Template:
+
+```markdown
+# STOP — read before modifying
+
+This bench was created by an automated provisioning script.
+Do NOT modify, teardown, or steal ports from this bench without reading this file.
+
+## Purpose
+
+<task_description>
+
+## Identity
+
+| Field         | Value                          |
+|---------------|--------------------------------|
+| Bench name    | <name>                         |
+| Type          | <disposable \| persistent>     |
+| Created by    | <signed_by>                    |
+| Created at    | <created_at ISO timestamp>     |
+| Branch tested | <branch>                       |
+| Registry      | <BENCH_ROOT>/registry.json     |
+
+## Ports and services
+
+| Service        | Port / DB index   |
+|----------------|-------------------|
+| Webserver      | <webserver_port>  |
+| Socket.io      | <socketio_port>   |
+| File watcher   | <file_watcher_port> |
+| Redis cache DB | <redis_cache_db>  |
+| Redis queue DB | <redis_queue_db>  |
+| Redis s.io DB  | <redis_socketio_db> |
+| MariaDB DB     | <db_name>         |
+| Site           | <site_name>       |
+
+## Starting the bench
+
+```bash
+cd <path>
+bench start
+# site available at http://localhost:<webserver_port>
+```
+
+## Agent instructions
+
+- **Disposable bench:** teardown via `mh teardown <name>` when no longer needed.
+  Do NOT teardown if work is still in progress.
+- **Persistent bench:** do NOT teardown. Contact the creating agent/developer.
+- Do NOT bind to or steal these ports for another bench — they are registered.
+- If you find this bench in an unknown state, run `mh audit` first.
+```
+
+Write this file atomically (write to a `.tmp` path then `mv`) so partial writes are never left behind.
 
 ---
 
@@ -437,11 +529,12 @@ Keep a single source of truth, for example `${BENCH_ROOT}/registry.json`. Each e
 - `path`
 - `site_name`
 - `status` (`provisioning`, `ready`, `stopping`, `stopped`, `failed`, `orphaned`)
+- `type` (`disposable` | `persistent`)
 - `ports` (webserver, socketio, file_watcher)
 - `redis` (cache_db, queue_db, socketio_db)
 - `database` (db_name, db_user)
 - `branch`, `worktree`, `purpose`
-- `created_at`, `created_by`
+- `created_at`, `created_by`, `signed_by`, `task_description`
 - `pid` or `process_group` of `bench start` if running
 
 ### 5.2 Audit / reconcile command
@@ -487,6 +580,28 @@ The audit command should be read-only by default. With `--fix` or `--prune` it m
 - Drop orphaned DBs/users after a confirmation prompt.
 - Release orphaned Redis DB indexes back to the pool.
 - Update registry status fields to match reality.
+- Write orphaned or torn-down entries to the workspace archive (see 5.4).
+
+### 5.4 Workspace archive tracking
+
+After a bench is torn down or an orphan is reconciled, the workspace should maintain an `archive` section in the registry (or a separate `archive.json` file at `${BENCH_ROOT}/archive.json`). Each archived entry retains all original registry fields plus:
+
+```json
+{
+  "name": "feature-x-20250725",
+  "...": "(all original registry fields)",
+  "torn_down_at": "2025-07-26T10:00:00Z",
+  "torn_down_by": "claude",
+  "outcome": "clean"
+}
+```
+
+`outcome` values:
+- `"clean"` — bench stopped, DB/Redis/files fully removed.
+- `"partial"` — some resources could not be cleaned (e.g. DB existed but directory already gone). Manual review needed.
+- `"orphaned"` — bench was never in registry; discovered and archived by audit.
+
+The archive is append-only and never purged by scripts. It gives the workspace a complete history of what benches were created, why, by whom, and what happened to them.
 
 ---
 
@@ -521,8 +636,9 @@ done
 # 6. Remove bench directory.
 rm -rf "${BENCH_DIR}"
 
-# 7. Remove registry entry (or mark "stopped" if you keep history).
-# 8. Unlock registry.
+# 7. Append entry to archive (${BENCH_ROOT}/archive.json) with torn_down_at, torn_down_by, outcome.
+# 8. Remove registry entry (or mark "stopped").
+# 9. Unlock registry.
 ```
 
 ### 6.2 Partial-provision rollback
@@ -684,6 +800,10 @@ Configuration points you must set before using the templates:
 | `REDIS_HOST` | `redis` | Shared Redis service hostname |
 | `APP_REPO` | `git@github.com:org/app.git` | App repository URL |
 | `APP_NAME` | `myapp` | Frappe app name |
+| `SIGNED_BY` | `claude` | Agent or human identity creating the bench (`claude`, `agy`, `codex`, `kimi`, `human`, etc.) |
+| `TASK_DESCRIPTION` | `"Test auth refactor before PR merge"` | Short description of why this bench was created |
+
+`audit.sh` reconciles registry vs reality and, for any orphaned or missing entries discovered, writes them to the workspace archive (`${BENCH_ROOT}/archive.json`) with `outcome: "orphaned"` before flagging them in the report.
 
 ---
 
