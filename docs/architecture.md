@@ -14,9 +14,9 @@ flowchart TB
 
         subgraph Benches["Benches"]
             Reference["Reference Bench<br/>(stable, never mutated)"]
-            D1["Disposable Bench 1<br/>feature/x"]
-            D2["Disposable Bench 2<br/>feature/y"]
-            D3["Disposable Bench 3<br/>PR #123"]
+        D1["Disposable Bench 1<br/>feature/x checkout"]
+        D2["Disposable Bench 2<br/>feature/y checkout"]
+        D3["Disposable Bench 3<br/>PR #123 checkout"]
         end
 
         Registry["Registry<br/>registry.json"]
@@ -51,9 +51,18 @@ flowchart TB
 
 ### Disposable benches
 
-- One per feature branch, worktree, or PR.
+- One per feature branch, track worktree, or PR.
 - Full independent `bench init` with its own `apps/`, `env/`, `sites/`.
+- `apps/<app>` is a normal Git checkout of the selected branch, not a symlink to
+  the coding worktree.
 - Short-lived; torn down after work is done.
+
+### Track development worktrees
+
+- One managed Git worktree per disposable bench, created under the owning track.
+- This is the coding/commit path and is separate from the bench checkout.
+- Teardown removes it through `git worktree remove --force` after the bench is
+  stopped and its app checkout is removed.
 
 ### Shared MariaDB
 
@@ -77,7 +86,8 @@ flowchart TB
 
 | Resource | Isolation mechanism |
 |----------|---------------------|
-| App code | Separate `apps/` directory per bench |
+| App code in bench | Separate normal Git branch checkout per bench |
+| Development code | Track-owned Git worktree per bench |
 | Python env | Separate `env/` per bench |
 | Database | Separate DB name + DB user per bench |
 | Redis cache | Separate Redis DB index per bench |

@@ -17,16 +17,18 @@ REDIS_HOST="${REDIS_HOST:-redis}"
 QUARANTINE_DIR="${BENCH_ROOT}/.quarantine"
 DB_PREFIX="${DB_PREFIX:-bench_}"
 FIX=false
+FORCE_WORKTREES=false
 JSON=false
 # =======================================================
 
 usage() {
   cat <<EOF
-Usage: $0 [--json] [--fix]
+Usage: $0 [--json] [--fix] [--force-worktrees]
 
 Options:
   --json   Output machine-readable JSON
   --fix    Move orphaned directories to quarantine and release resources
+  --force-worktrees  With --fix, remove registered orphaned Git worktrees
   --help   Show this help
 EOF
 }
@@ -35,6 +37,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --json) JSON=true; shift ;;
     --fix) FIX=true; shift ;;
+    --force-worktrees) FORCE_WORKTREES=true; shift ;;
     --help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
   esac
@@ -62,10 +65,24 @@ jq -r '.benches[] | @base64' "$REGISTRY_FILE" | while read -r row; do
   db_name=$(echo "$entry" | jq -r '.database.db_name')
   db_user=$(echo "$entry" | jq -r '.database.db_user')
   redis_cache_db=$(echo "$entry" | jq -r '.redis.cache_db')
+  branch=$(echo "$entry" | jq -r '.branch // empty')
+  worktree=$(echo "$entry" | jq -r '.worktree // empty')
+  source_repo=$(echo "$entry" | jq -r '.source_repo // empty')
+  track_dir=$(echo "$entry" | jq -r '.track_dir // empty')
+  worktree_managed=$(echo "$entry" | jq -r '.worktree_managed // false')
+  bench_app_checkout=$(echo "$entry" | jq -r '.bench_app_checkout // empty')
 
   # path exists?
   if [ ! -d "$path" ]; then
     report_missing "bench '$name': directory missing ($path)"
+    if [ "$worktree_managed" = "true" ] && [ "$FIX" = true ] && [ "$FORCE_WORKTREES" = true ] \
+      && [ -d "$worktree" ] && [ -d "$source_repo" ]; then
+      if git -C "$source_repo" worktree remove --force "$worktree"; then
+        report_orphan "bench '$name': removed orphaned development worktree ($worktree)"
+      else
+        report_drift "bench '$name': failed to remove orphaned development worktree ($worktree)"
+      fi
+    fi
   else
     report_ok "bench '$name': directory exists"
   fi
@@ -104,6 +121,34 @@ jq -r '.benches[] | @base64' "$REGISTRY_FILE" | while read -r row; do
     report_ok "bench '$name': user $db_user exists"
   else
     report_missing "bench '$name': user $db_user missing"
+  fi
+
+  # Development worktree and bench branch checkout must remain separate.
+  if [ "$worktree_managed" = "true" ]; then
+    if [ -z "$worktree" ] || [ -z "$source_repo" ] || [ -z "$track_dir" ]; then
+      report_drift "bench '$name': incomplete managed worktree metadata"
+    elif [[ "$worktree" != "$track_dir"/* ]]; then
+      report_drift "bench '$name': worktree outside track directory ($worktree)"
+    elif [ ! -d "$worktree" ]; then
+      report_missing "bench '$name': development worktree missing ($worktree)"
+    elif ! git -C "$source_repo" worktree list --porcelain 2>/dev/null | grep -Fq "worktree $worktree"; then
+      report_drift "bench '$name': path is not registered as a Git worktree ($worktree)"
+    else
+      report_ok "bench '$name': development worktree registered"
+    fi
+
+    if [ -z "$bench_app_checkout" ] || [ -L "$bench_app_checkout" ]; then
+      report_drift "bench '$name': bench app is missing or is a symlink ($bench_app_checkout)"
+    elif [ ! -d "$bench_app_checkout/.git" ]; then
+      report_drift "bench '$name': bench app is not a Git checkout ($bench_app_checkout)"
+    else
+      checkout_branch=$(git -C "$bench_app_checkout" branch --show-current 2>/dev/null || true)
+      if [ "$checkout_branch" = "$branch" ]; then
+        report_ok "bench '$name': bench app checkout is on branch $branch"
+      else
+        report_drift "bench '$name': bench app branch is '$checkout_branch', expected '$branch'"
+      fi
+    fi
   fi
 done
 

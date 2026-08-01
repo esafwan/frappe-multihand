@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# teardown.sh — remove a disposable Frappe bench and release its resources.
+# teardown.sh — remove a disposable Frappe bench, branch checkout, and worktree.
 #
 # This is a template. Adapt the configuration block below to your environment.
 # Supports --dry-run. Refuses to touch the reference bench.
@@ -14,6 +14,7 @@ DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD:-change-me}"
 DB_ROOT_USER="${DB_ROOT_USER:-root}"
 MARIADB_HOST="${MARIADB_HOST:-mariadb}"
 REDIS_HOST="${REDIS_HOST:-redis}"
+SIGNED_BY="${SIGNED_BY:-${USER:-unknown}}"
 DRY_RUN=false
 # =======================================================
 
@@ -62,6 +63,11 @@ if [ -z "$ENTRY" ]; then
   exit 1
 fi
 
+command -v git >/dev/null 2>&1 || {
+  echo "ERROR: required command not found: git" >&2
+  exit 1
+}
+
 SITE_NAME=$(echo "$ENTRY" | jq -r '.site_name')
 DB_NAME=$(echo "$ENTRY" | jq -r '.database.db_name')
 DB_USER=$(echo "$ENTRY" | jq -r '.database.db_user')
@@ -69,6 +75,26 @@ REDIS_CACHE_DB=$(echo "$ENTRY" | jq -r '.redis.cache_db')
 REDIS_QUEUE_DB=$(echo "$ENTRY" | jq -r '.redis.queue_db')
 REDIS_SOCKETIO_DB=$(echo "$ENTRY" | jq -r '.redis.socketio_db')
 PID=$(echo "$ENTRY" | jq -r '.pid // empty')
+WORKTREE=$(echo "$ENTRY" | jq -r '.worktree // empty')
+SOURCE_REPO=$(echo "$ENTRY" | jq -r '.source_repo // empty')
+TRACK_DIR=$(echo "$ENTRY" | jq -r '.track_dir // empty')
+WORKTREE_MANAGED=$(echo "$ENTRY" | jq -r '.worktree_managed // false')
+BENCH_APP_CHECKOUT=$(echo "$ENTRY" | jq -r '.bench_app_checkout // empty')
+
+if [ "$WORKTREE_MANAGED" = "true" ]; then
+  [ -n "$WORKTREE" ] && [ -n "$SOURCE_REPO" ] && [ -n "$TRACK_DIR" ] || {
+    echo "ERROR: registry entry lacks managed worktree metadata" >&2
+    exit 1
+  }
+  case "$WORKTREE" in
+    "$TRACK_DIR"/*) ;;
+    *) echo "ERROR: refusing worktree outside track directory: $WORKTREE" >&2; exit 1 ;;
+  esac
+  [ -d "$SOURCE_REPO" ] && git -C "$SOURCE_REPO" rev-parse --git-dir >/dev/null 2>&1 || {
+    echo "ERROR: source repository is unavailable: $SOURCE_REPO" >&2
+    exit 1
+  }
+fi
 
 log "Tearing down bench '$NAME'"
 log "  site: $SITE_NAME, db: $DB_NAME / $DB_USER"
@@ -133,12 +159,43 @@ if [ -d "$BENCH_DIR" ]; then
   fi
 fi
 
+# Remove the development worktree through Git. The bench app checkout was
+# removed with BENCH_DIR above; it is intentionally not the worktree path.
+WORKTREE_REMOVED=true
+if [ "$WORKTREE_MANAGED" = "true" ]; then
+  if [ "$DRY_RUN" = false ]; then
+    if [ -e "$WORKTREE" ]; then
+      log "Removing development worktree $WORKTREE"
+      if ! git -C "$SOURCE_REPO" worktree remove --force "$WORKTREE"; then
+        WORKTREE_REMOVED=false
+      fi
+    else
+      log "Development worktree already absent: $WORKTREE"
+    fi
+  else
+    echo "[DRY-RUN] would remove Git worktree $WORKTREE from $SOURCE_REPO"
+  fi
+fi
+
+if [ "$WORKTREE_REMOVED" != true ]; then
+  echo "ERROR: bench removed but development worktree cleanup failed; registry retained" >&2
+  exec 200>"$LOCK_FILE"
+  flock -x 200
+  TMP=$(mktemp)
+  jq --arg name "$NAME" '.benches[$name].status = "failed" | .benches[$name].cleanup_error = "worktree removal failed"' "$REGISTRY_FILE" > "$TMP"
+  mv "$TMP" "$REGISTRY_FILE"
+  flock -u 200
+  exit 1
+fi
+
 # Remove registry entry
 exec 200>"$LOCK_FILE"
 flock -x 200
 if [ "$DRY_RUN" = false ]; then
   TMP=$(mktemp)
-  jq --arg name "$NAME" 'del(.benches[$name])' "$REGISTRY_FILE" > "$TMP"
+  jq --arg name "$NAME" --arg signer "$SIGNED_BY" \
+    '.archive = ((.archive // []) + [(.benches[$name] + {torn_down_at: (now | todate), torn_down_by: $signer, worktree_removed: true, outcome: "clean"})]) | del(.benches[$name])' \
+    "$REGISTRY_FILE" > "$TMP"
   mv "$TMP" "$REGISTRY_FILE"
 else
   echo "[DRY-RUN] would remove registry entry for $NAME"

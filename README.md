@@ -15,7 +15,7 @@ Frappe development often needs isolated environments: one for a feature branch, 
 Creating a completely separate Docker stack for every branch is slow and wasteful. This skill defines a pragmatic middle ground:
 
 - One **reference bench** stays stable and is never mutated.
-- Many **disposable benches** are created on demand, one per worktree/branch/PR.
+- Many **disposable benches** are created on demand, one per track worktree/branch/PR.
 - All benches share MariaDB and Redis containers, but each bench gets its own DB user, DB name, Redis DB index, and port tuple.
 - A small **registry** tracks every bench so nothing is orphaned.
 
@@ -45,6 +45,11 @@ Each agent can:
 
 The **registry** keeps track of every bench, so agents don't fight over ports or leave orphaned databases behind. The **reference bench** stays untouched, so there's always a clean baseline to compare against or restore from.
 
+The development worktree and running bench are deliberately different paths: the
+worktree under the track is where code is edited and committed; the bench
+contains a separate normal Git checkout of the selected branch. Uncommitted
+worktree changes do not silently change a running bench.
+
 ### Slash commands for agents
 
 The `mh` helper also defines slash-command-style triggers that agents can interpret:
@@ -68,7 +73,7 @@ If `mh` is not on `PATH`, agents fall back to the underlying `examples/*.sh` scr
 | `docs/architecture.md` | Architecture overview and diagram. |
 | `examples/docker-compose.yml` | Minimal shared-services compose file. |
 | `examples/registry.json` | Sample registry showing reference + disposable benches. |
-| `examples/provision.sh` | Template script to create a disposable bench. |
+| `examples/provision.sh` | Template script to create a track worktree and a separate branch checkout in a disposable bench. |
 | `examples/teardown.sh` | Template script to remove a disposable bench. |
 | `examples/audit.sh` | Template script to reconcile registry vs reality. |
 | `examples/mh` | Helper CLI: `mh new`, `mh list`, `mh testplan`, `mh open`, `mh teardown`, `mh audit`, `mh status`, `mh doctor`. |
@@ -92,7 +97,9 @@ If `mh` is not on `PATH`, agents fall back to the underlying `examples/*.sh` scr
 4. **Create a disposable bench** using the `mh` helper:
 
    ```bash
-   ./examples/mh new feature-x --branch feature/x --app myapp --from-reference
+   ./examples/mh new feature-x --branch feature/x \
+     --track-dir /path/to/Tracks/owner.Feature \
+     --source-repo /path/to/app --app myapp --from-reference
    ```
 
    Or use the underlying script directly:
@@ -101,6 +108,8 @@ If `mh` is not on `PATH`, agents fall back to the underlying `examples/*.sh` scr
    ./examples/provision.sh \
      --name feature-x \
      --branch feature/x \
+     --track-dir /path/to/Tracks/owner.Feature \
+     --source-repo /path/to/app \
      --app myapp \
      --from-reference
    ```
@@ -141,7 +150,13 @@ To adapt:
 ## Safety model
 
 - The reference bench is protected by a hard-coded guard in every script.
+- Every disposable bench requires a track directory and creates a managed Git
+  development worktree before provisioning.
+- The running bench always uses a separate normal checkout of the selected
+  branch, never the development worktree or a symlink.
 - Teardown never uses `FLUSHALL`; it only flushes per-bench Redis DB indexes.
+- Teardown removes the managed development worktree through Git and retains the
+  registry entry if cleanup is partial.
 - All destructive actions support `--dry-run`.
 - The registry is locked during allocation to prevent races between agents.
 

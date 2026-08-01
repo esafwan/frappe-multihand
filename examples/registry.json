@@ -34,7 +34,12 @@
       "path": "/opt/benches/feature-x-20250725",
       "site_name": "feature-x.local",
       "branch": "feature/x",
-      "worktree": "/opt/worktrees/myapp/feature-x",
+      "track_dir": "/workspace/Tracks/owner.Feature",
+      "source_repo": "/workspace/app-source",
+      "worktree": "/workspace/Tracks/owner.Feature/worktrees/feature-x/myapp",
+      "worktree_managed": true,
+      "app_name": "myapp",
+      "bench_app_checkout": "/opt/benches/feature-x/apps/myapp",
       "purpose": "Test feature/x before PR",
       "ports": {
         "webserver": 8081,

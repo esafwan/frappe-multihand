@@ -124,14 +124,34 @@ Never assume a reference bench exists without confirmation.
 
 ### 3.1 One bench per disposable worktree/branch
 
-Each disposable bench is a full, independent `bench init`. It owns:
+Each disposable bench is a full, independent `bench init` and **must have a
+track-owned Git worktree for coding plus a separate normal Git checkout for the
+branch under test**. The shared source checkout is reference-only and must
+never be used as the bench's app path. It owns:
 
-- its own `apps/` directory (a copy or worktree of the app under test),
+- its own `apps/` directory containing a normal Git checkout of the branch under
+  test (never a symlink to the development worktree),
 - its own Python `env/`,
 - its own `sites/`,
 - its own allocated ports.
 
-The bench lives in a dedicated directory under a **bench root**, e.g. `${BENCH_ROOT}/<bench-name>/`.
+The bench lives in a dedicated directory under a **bench root**, e.g.
+`${BENCH_ROOT}/<bench-name>/`, while the app worktree lives under the owning
+track, e.g. `${TRACK_DIR}/worktrees/<bench-name>/<app-name>/`. The bench's
+`apps/<app-name>` entry is a separate checkout of the same branch, created from
+the source repository or pushed branch. The registry records both paths and
+marks the development worktree as skill-managed.
+
+Provisioning must fail if no track directory is supplied, if the development
+worktree is outside that track, if the bench app path is the shared source
+checkout or a symlink, or if a registered development worktree is missing or is
+not a Git worktree.
+
+Teardown removes the bench app checkout and its skill-managed development
+worktree together. It must use `git worktree remove --force` from the source
+repository for the development worktree, never `rm -rf` on a worktree path. If
+worktree removal fails, teardown must report partial cleanup and stop before
+deleting the registry entry.
 
 ### 3.2 Reference bench
 
@@ -225,6 +245,9 @@ Before creating resources, verify:
 2. The intended `(webserver_port, socketio_port, file_watcher_port)` tuple is not already reserved in the registry or in use on the host.
 3. Redis DB indexes for cache/queue/socketio are not already reserved in the registry.
 4. The registry lock file is free.
+5. A track directory is supplied and the development worktree path is inside it.
+6. The source repository is distinct from the development worktree and the
+   shared checkout is not passed directly as the bench app path.
 
 ### 4.2 Atomic registry write (concurrency safety)
 
@@ -250,7 +273,12 @@ A minimal registry entry (JSON or YAML) must contain:
   "path": "${BENCH_ROOT}/feature-x-20250725",
   "site_name": "feature-x.local",
   "branch": "feature/x",
-  "worktree": "${APP_WORKTREE_ROOT}/feature-x",
+  "track_dir": "/workspace/Tracks/owner.Feature",
+  "source_repo": "/workspace/app-source",
+  "worktree": "/workspace/Tracks/owner.Feature/worktrees/feature-x/myapp",
+  "worktree_managed": true,
+  "app_name": "myapp",
+  "bench_app_checkout": "${BENCH_ROOT}/feature-x/apps/myapp",
   "purpose": "Test feature/x before PR",
   "ports": {
     "webserver": 8081,
@@ -296,8 +324,11 @@ bench init --frappe-branch version-15 \
 
 cd "${BENCH_DIR}"
 
-# 3. Get the app(s) under test (or use a local worktree path).
-bench get-app "${APP_REPO}" --branch "${BRANCH}"
+# 3. Create the app checkout under the bench from the selected branch.
+# The development worktree is under TRACK_DIR; it is not mounted or symlinked
+# into this bench.
+git clone --branch "${BRANCH}" --single-branch \
+  "${SOURCE_REPO}" "${BENCH_DIR}/apps/${APP_NAME}"
 
 # 4. Set common-site config (ports, Redis, DB host).
 bench set-config -g db_host mariadb
@@ -534,6 +565,7 @@ Keep a single source of truth, for example `${BENCH_ROOT}/registry.json`. Each e
 - `redis` (cache_db, queue_db, socketio_db)
 - `database` (db_name, db_user)
 - `branch`, `worktree`, `purpose`
+- `track_dir`, `source_repo`, `worktree_managed`, `app_name`, `bench_app_checkout`
 - `created_at`, `created_by`, `signed_by`, `task_description`
 - `pid` or `process_group` of `bench start` if running
 
@@ -636,9 +668,14 @@ done
 # 6. Remove bench directory.
 rm -rf "${BENCH_DIR}"
 
-# 7. Append entry to archive (${BENCH_ROOT}/archive.json) with torn_down_at, torn_down_by, outcome.
-# 8. Remove registry entry (or mark "stopped").
-# 9. Unlock registry.
+# 7. Remove the bench app checkout (a normal branch checkout).
+# 8. Remove the skill-managed Git development worktree from its source repository.
+git -C "${SOURCE_REPO}" worktree remove --force "${WORKTREE}"
+
+# 9. Append entry to archive (${BENCH_ROOT}/archive.json) with torn_down_at,
+#    torn_down_by, worktree_removed, and outcome.
+# 10. Remove registry entry (or mark "stopped") only after worktree cleanup.
+# 11. Unlock registry.
 ```
 
 ### 6.2 Partial-provision rollback
@@ -651,6 +688,10 @@ If provisioning fails after the registry intent record is written, teardown must
 - Port/Redis allocations are released from the registry only after cleanup.
 
 Therefore the same teardown script can be invoked both for normal teardown and for rollback. Mark the registry status `failed` during rollback so audit can report it.
+
+If a development worktree was created before bench provisioning failed, rollback
+must remove that worktree as well. A failed bench directory must never leave a
+live branch checkout under the track.
 
 ### 6.3 Reference bench guard
 
@@ -670,6 +711,18 @@ fi
 ### 7.1 Orphaned directories
 
 Any directory under `${BENCH_ROOT}/` that is not present in the registry is an orphan. Do not delete automatically; move to `${BENCH_ROOT}/.quarantine/` and flag in audit.
+
+### 7.1a Orphaned worktrees
+
+For every registry entry with `worktree_managed: true`, audit must verify that:
+
+- `worktree` exists;
+- `git -C <source_repo> worktree list --porcelain` contains that path; and
+- the path is inside `track_dir`.
+
+For every managed worktree whose bench entry is missing, report it as an orphan
+and remove it only with an explicit `--fix --force-worktrees` action. Never
+delete an arbitrary directory merely because its name resembles a branch.
 
 ### 7.2 Orphaned MariaDB resources
 
@@ -716,6 +769,9 @@ If a DB index has keys but no registry entry uses that index, it is orphaned.
 3. **Never run `redis-cli flushall`.** Always use `FLUSHDB` on the specific DB index.
 4. **Never reuse a Redis DB index** that is already allocated to another bench.
 5. **Never reuse a port tuple** without verifying it is free.
+6. **Never provision an app from the shared source checkout or a symlink.** The
+   bench must contain a normal checkout of the selected branch.
+7. **Remove managed development worktrees with Git, not `rm -rf`.**
 
 ### 8.2 Shared-queue risk
 
@@ -799,7 +855,9 @@ Configuration points you must set before using the templates:
 | `FILE_WATCHER_BASE_PORT` | `6787` | Base for disposable file-watcher ports |
 | `REDIS_HOST` | `redis` | Shared Redis service hostname |
 | `APP_REPO` | `git@github.com:org/app.git` | App repository URL |
+| `SOURCE_REPO` | `/path/to/app-repo` | Local Git repository used to create the track worktree and bench branch checkout |
 | `APP_NAME` | `myapp` | Frappe app name |
+| `TRACK_DIR` | `/path/to/Tracks/owner.Feature` | Owning track directory; all development worktrees must live below it |
 | `SIGNED_BY` | `claude` | Agent or human identity creating the bench (`claude`, `agy`, `codex`, `kimi`, `human`, etc.) |
 | `TASK_DESCRIPTION` | `"Test auth refactor before PR merge"` | Short description of why this bench was created |
 
@@ -815,13 +873,13 @@ The `examples/mh` script is a thin wrapper that provides quick commands for huma
 
 | Command | What it does |
 |---------|--------------|
-| `mh new <name> --branch <branch> [--app <app>] [--from-reference] [--dry-run]` | Create a disposable bench (wraps `provision.sh`). |
+| `mh new <name> --branch <branch> --track-dir <dir> [--source-repo <repo>] [--app <app>] [--from-reference] [--dry-run]` | Create a development worktree and a separate branch checkout in a disposable bench (wraps `provision.sh`). |
 | `mh list [--json]` | List registered benches (wraps `list.sh`). |
 | `mh testplan <name> [--output <file>]` | Generate a test plan template for a bench. |
 | `mh open <name>` | Open the bench site in the default browser. |
 | `mh logs <name>` | Tail the bench logs. |
 | `mh teardown <name> [--dry-run]` | Remove a disposable bench (wraps `teardown.sh`). |
-| `mh audit [--fix] [--json]` | Reconcile registry vs reality (wraps `audit.sh`). |
+| `mh audit [--fix] [--force-worktrees] [--json]` | Reconcile registry vs reality (wraps `audit.sh`). |
 | `mh status` | Quick status of benches (ports, processes). |
 | `mh doctor` | Check environment prerequisites. |
 
@@ -851,9 +909,13 @@ If `mh` is not on `PATH`, fall back to running the underlying `examples/*.sh` sc
 Alternatives to reduce cost:
 
 - **Frozen framework copy:** maintain a pre-built Frappe framework image or volume. Clone it per bench instead of running `bench init` from scratch.
-- **App-only worktrees:** keep the framework directory shared/read-only and use Git worktrees only for the app under test. This deviates from the "full independent bench" model but is viable if you accept shared framework code.
+- **App-only development worktrees:** keep the framework directory shared/read-only,
+  but still create a separate normal branch checkout inside each bench. The
+  development worktree must remain under its track.
 - **Persistent disposable bench pool:** keep a warm pool of pre-initialized benches. An agent checks out a ready bench, renames/configures it, and returns it to a teardown queue.
-- **Bind-mount app source:** instead of copying `apps/myapp`, mount the worktree directory into the bench container. Avoids duplication but requires the app to tolerate being run from a mounted path.
+- Do not bind-mount the development worktree into the running bench; that breaks
+  the branch-checkout boundary and allows uncommitted code to change runtime
+  behavior.
 
 Even with optimizations, each disposable bench should still have its own `sites/`, `env/`, ports, DB user, and Redis DB index.
 
@@ -885,12 +947,13 @@ Even with optimizations, each disposable bench should still have its own `sites/
 
 ## 13. Summary
 
-Use one disposable `bench init` per branch/worktree, with a protected reference bench for reference data. Share MariaDB and Redis containers across benches, but isolate each bench by:
+Use one disposable `bench init` per branch/worktree, with a protected reference bench for reference data. Create the development worktree inside the owning track before provisioning the bench, then deploy the selected branch as a separate normal checkout inside the bench. Remove both during teardown. Share MariaDB and Redis containers across benches, but isolate each bench by:
 
 - unique MariaDB user + database,
 - unique Redis DB indexes (or instances),
 - unique published port tuple,
 - a machine-readable, locked registry,
+- a track-owned Git development worktree plus a branch checkout recorded in the registry,
 - idempotent provision/teardown scripts with `--dry-run` support.
 
 Audit regularly. Never `FLUSHALL`. Never touch the reference bench. Always copy the encryption key after restore.

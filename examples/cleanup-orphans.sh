@@ -10,12 +10,13 @@ AUDIT_SCRIPT="${AUDIT_SCRIPT:-$(dirname "$0")/audit.sh}"
 
 usage() {
   cat <<EOF
-Usage: $0 [--dirs] [--db] [--redis] [--dry-run] [--force]
+Usage: $0 [--dirs] [--db] [--redis] [--worktrees] [--dry-run] [--force]
 
 Options:
   --dirs    Quarantine orphaned directories
   --db      Drop orphaned databases/users (requires --force)
   --redis   Flush orphaned Redis DBs (requires --force)
+  --worktrees  Remove registered orphaned Git worktrees (requires --force)
   --dry-run Print actions without executing
   --force   Required for destructive --db/--redis actions
   --help    Show this help
@@ -27,12 +28,14 @@ FORCE=false
 DO_DIRS=false
 DO_DB=false
 DO_REDIS=false
+DO_WORKTREES=false
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --dirs) DO_DIRS=true; shift ;;
     --db) DO_DB=true; shift ;;
     --redis) DO_REDIS=true; shift ;;
+    --worktrees) DO_WORKTREES=true; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
     --force) FORCE=true; shift ;;
     --help) usage; exit 0 ;;
@@ -40,15 +43,20 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if [ "$DO_DB" = true ] || [ "$DO_REDIS" = true ]; then
+if [ "$DO_DB" = true ] || [ "$DO_REDIS" = true ] || [ "$DO_WORKTREES" = true ]; then
   if [ "$FORCE" != true ]; then
-    echo "ERROR: --db and --redis require --force" >&2
+    echo "ERROR: --db, --redis, and --worktrees require --force" >&2
     exit 1
   fi
 fi
 
 echo "This is a template wrapper. The real logic lives in audit.sh --fix."
 echo "Recommended: implement --db/--redis cleanup by extending audit.sh."
-echo "Running audit.sh --fix --json for review..."
+AUDIT_ARGS=(--fix --json)
+if [ "$DO_WORKTREES" = true ]; then
+  AUDIT_ARGS+=(--force-worktrees)
+fi
 
-"$AUDIT_SCRIPT" --fix --json
+echo "Running audit.sh ${AUDIT_ARGS[*]} for review..."
+
+"$AUDIT_SCRIPT" "${AUDIT_ARGS[@]}"

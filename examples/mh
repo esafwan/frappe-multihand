@@ -8,7 +8,7 @@
 #   mh <command> [args]
 #
 # Commands:
-#   new <name> --branch <branch> [--app <app>] [--from-reference] [--dry-run]
+#   new <name> --branch <branch> --track-dir <dir> [--source-repo <repo>] [--app <app>] [--from-reference] [--dry-run]
 #   list [--json]
 #   testplan <name> [--output <file>]
 #   open <name>
@@ -36,8 +36,8 @@ mh — frappe-multihand helper CLI
 Usage: mh <command> [args]
 
 Commands:
-  new <name> --branch <branch> [--app <app>] [--from-reference] [--dry-run]
-      Create a disposable bench.
+  new <name> --branch <branch> --track-dir <dir> [--source-repo <repo>] [--app <app>] [--from-reference] [--dry-run]
+      Create a development worktree and a separate branch checkout in a disposable bench.
 
   list [--json]
       List registered benches.
@@ -54,7 +54,7 @@ Commands:
   teardown <name> [--dry-run]
       Remove a disposable bench.
 
-  audit [--fix] [--json]
+  audit [--fix] [--force-worktrees] [--json]
       Reconcile registry vs reality.
 
   status
