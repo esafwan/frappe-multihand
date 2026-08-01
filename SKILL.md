@@ -815,6 +815,52 @@ Always set the encryption key immediately after restore.
 
 All registry writes, port allocations, and teardowns must take the same filesystem lock. A race between two provisioning agents can cause duplicate port/DB allocation and cross-bench corruption.
 
+### 8.7 Determining the actual DB root password
+
+Do not assume the MariaDB root password matches a hard-coded value in the provisioning script. In shared devcontainers the password is set once when the MariaDB container was created and may differ from `.env` defaults. Read it from the running container before provisioning:
+
+```bash
+DB_ROOT_PASSWORD=$(docker inspect -f \
+  '{{range .Config.Env}}{{if eq (index (split . "=") 0) "MYSQL_ROOT_PASSWORD"}}{{index (split . "=") 1}}{{end}}{{end}}' \
+  <mariadb-container-name>)
+```
+
+Then verify connectivity before running `bench new-site`:
+
+```bash
+mariadb -h mariadb -u root -p"${DB_ROOT_PASSWORD}" -e "SELECT 1;"
+```
+
+If the script is running inside the same container as the bench (not the MariaDB container), the environment variable may not be in scope; inspect the MariaDB container instead.
+
+### 8.8 Port access when the bench container cannot be republished
+
+If the shared frappe/bench container was started with a fixed set of published ports (e.g. `8000-8005` and `9000-9005`) and the allocated port falls outside that range, host-level access will fail even though `bench start` is healthy. Two safe fixes:
+
+1. **Preferred:** allocate a port inside the already-published range, if one is free.
+2. **Proxy container:** start a tiny sidecar that forwards the allocated port without restarting the shared bench container. Example using `alpine/socat`:
+
+   ```bash
+   docker run -d \
+     --name "${BENCH_NAME}-proxy" \
+     --network <frappe-docker-network> \
+     --entrypoint sh \
+     -p "${WEBSERVER_PORT}:${WEBSERVER_PORT}" \
+     -p "${SOCKETIO_PORT}:${SOCKETIO_PORT}" \
+     alpine/socat \
+     -c "socat TCP-LISTEN:${WEBSERVER_PORT},fork,reuseaddr TCP:<frappe-container-name>:${WEBSERVER_PORT} & socat TCP-LISTEN:${SOCKETIO_PORT},fork,reuseaddr TCP:<frappe-container-name>:${SOCKETIO_PORT} & wait"
+   ```
+
+   Record the proxy container name in the registry so teardown can remove it.
+
+### 8.9 Container `/etc/hosts` writes
+
+Registering `${SITE_NAME}` in `/etc/hosts` inside the bench container is required for Socket.io authentication, but the container user may lack write permission. The registration should be attempted with `|| true` so provisioning does not abort; if it fails, Socket.io connections will be rejected. Fix options:
+
+- Add the mapping via Docker Compose `extra_hosts` or `docker run --add-host` when the container is created.
+- Run the registration step with `sudo` if available.
+- Use a local DNS resolver or proxy that resolves `${SITE_NAME}` to `127.0.0.1`.
+
 ### 8.6 Idempotency verification
 
 A provision script should:
