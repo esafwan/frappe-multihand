@@ -289,6 +289,11 @@ if [ -e "$APP_PATH" ] || [ -L "$APP_PATH" ]; then
   }
 else
   dry git clone --branch "$BRANCH" --single-branch "$SOURCE_REPO" "$APP_PATH"
+  
+  if [ "$DRY_RUN" = false ]; then
+    echo "$APP" >> "$BENCH_DIR/sites/apps.txt"
+  fi
+  dry bench pip install -e "$APP_PATH"
 fi
 
 cd "$BENCH_DIR"
