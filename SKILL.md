@@ -225,6 +225,8 @@ fi
 
 Replace `REDIS_CACHE_DB`, `REDIS_QUEUE_DB`, `REDIS_SOCKETIO_DB` with per-bench Redis DB indexes. The service name `redis` above is illustrative; match the actual service name in your compose file (common alternatives are `redis-cache`, `redis-queue`, `redis-socketio`, or a single `redis`).
 
+The example `examples/provision.sh` does this automatically: if `REDIS_HOST` is not set explicitly, it parses `redis_cache`, `redis_queue`, and `redis_socketio` from the reference bench's `sites/common_site_config.json` and reuses those service names/ports, appending the newly allocated DB index for isolation.
+
 Per-site config example:
 
 ```bash
@@ -331,6 +333,9 @@ git clone --branch "${BRANCH}" --single-branch \
   "${SOURCE_REPO}" "${BENCH_DIR}/apps/${APP_NAME}"
 
 # 4. Set common-site config (ports, Redis, DB host).
+# In real setups, use the service names from the reference bench's
+# common_site_config.json (e.g. redis-cache / redis-queue) rather than the
+# illustrative `redis` host shown here.
 bench set-config -g db_host mariadb
 bench set-config -g db_port 3306
 bench set-config -g redis_cache "redis://redis:6379/${REDIS_CACHE_DB}"

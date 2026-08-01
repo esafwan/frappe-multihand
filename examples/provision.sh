@@ -31,6 +31,39 @@ DRY_RUN=false
 FROM_REFERENCE=false
 # =======================================================
 
+# Parse redis://host:port[/db] and emit "host:port". Defaults to the value of
+# REDIS_HOST (or "redis") on port 6379 when the URL is missing or malformed.
+parse_redis_url() {
+  local url="$1"
+  local host="${REDIS_HOST:-redis}" port="6379"
+  if [[ "$url" =~ ^redis://([^:/]+)(:([0-9]+))?(/[0-9]+)?$ ]]; then
+    host="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[3]:-6379}"
+  fi
+  echo "${host}:${port}"
+}
+
+# If a reference bench exists and REDIS_HOST was not explicitly overridden,
+# inherit its Redis service names and ports. Each disposable bench still gets
+# its own DB index for isolation.
+REDIS_CACHE_HOST="${REDIS_HOST:-redis}"
+REDIS_QUEUE_HOST="${REDIS_HOST:-redis}"
+REDIS_SOCKETIO_HOST="${REDIS_HOST:-redis}"
+REDIS_CACHE_PORT=6379
+REDIS_QUEUE_PORT=6379
+REDIS_SOCKETIO_PORT=6379
+if [ -z "${REDIS_HOST:-}" ] && [ -f "${REFERENCE_BENCH_DIR}/sites/common_site_config.json" ]; then
+  REF_REDIS_CACHE=$(jq -r '.redis_cache // empty' "${REFERENCE_BENCH_DIR}/sites/common_site_config.json")
+  REF_REDIS_QUEUE=$(jq -r '.redis_queue // empty' "${REFERENCE_BENCH_DIR}/sites/common_site_config.json")
+  REF_REDIS_SOCKETIO=$(jq -r '.redis_socketio // empty' "${REFERENCE_BENCH_DIR}/sites/common_site_config.json")
+  REDIS_CACHE_HOST=$(parse_redis_url "$REF_REDIS_CACHE" | cut -d: -f1)
+  REDIS_CACHE_PORT=$(parse_redis_url "$REF_REDIS_CACHE" | cut -d: -f2)
+  REDIS_QUEUE_HOST=$(parse_redis_url "$REF_REDIS_QUEUE" | cut -d: -f1)
+  REDIS_QUEUE_PORT=$(parse_redis_url "$REF_REDIS_QUEUE" | cut -d: -f2)
+  REDIS_SOCKETIO_HOST=$(parse_redis_url "$REF_REDIS_SOCKETIO" | cut -d: -f1)
+  REDIS_SOCKETIO_PORT=$(parse_redis_url "$REF_REDIS_SOCKETIO" | cut -d: -f2)
+fi
+
 usage() {
   cat <<EOF
 Usage: $0 --name <bench-name> --branch <branch> --track-dir <track-dir> [options]
@@ -187,7 +220,7 @@ log "  track: $TRACK_DIR"
 log "  worktree: $WORKTREE"
 log "  source: $SOURCE_REPO"
 log "  ports: web=$WEB_PORT socketio=$SOCK_PORT watcher=$WATCH_PORT"
-log "  redis DBs: cache=$REDIS_CACHE_DB queue=$REDIS_QUEUE_DB socketio=$REDIS_SOCKETIO_DB"
+log "  redis: cache=${REDIS_CACHE_HOST}:${REDIS_CACHE_PORT}/${REDIS_CACHE_DB} queue=${REDIS_QUEUE_HOST}:${REDIS_QUEUE_PORT}/${REDIS_QUEUE_DB} socketio=${REDIS_SOCKETIO_HOST}:${REDIS_SOCKETIO_PORT}/${REDIS_SOCKETIO_DB}"
 log "  db: $DB_NAME / $DB_USER"
 
 if [ "$DRY_RUN" = false ]; then
@@ -301,9 +334,9 @@ cd "$BENCH_DIR"
 # Configure
 dry bench set-config -g db_host "$MARIADB_HOST"
 dry bench set-config -g db_port 3306
-dry bench set-config -g redis_cache "redis://${REDIS_HOST}:6379/${REDIS_CACHE_DB}"
-dry bench set-config -g redis_queue "redis://${REDIS_HOST}:6379/${REDIS_QUEUE_DB}"
-dry bench set-config -g redis_socketio "redis://${REDIS_HOST}:6379/${REDIS_SOCKETIO_DB}"
+dry bench set-config -g redis_cache "redis://${REDIS_CACHE_HOST}:${REDIS_CACHE_PORT}/${REDIS_CACHE_DB}"
+dry bench set-config -g redis_queue "redis://${REDIS_QUEUE_HOST}:${REDIS_QUEUE_PORT}/${REDIS_QUEUE_DB}"
+dry bench set-config -g redis_socketio "redis://${REDIS_SOCKETIO_HOST}:${REDIS_SOCKETIO_PORT}/${REDIS_SOCKETIO_DB}"
 dry bench set-config -g webserver_port "$WEB_PORT"
 dry bench set-config -g socketio_port "$SOCK_PORT"
 dry bench set-config -g file_watcher_port "$WATCH_PORT"
