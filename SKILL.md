@@ -235,6 +235,32 @@ bench --site ${SITE_NAME} set-config db_password "${DB_PASSWORD}"
 bench --site ${SITE_NAME} set-config encryption_key "${ENCRYPTION_KEY}"
 ```
 
+### 3.6 Cross-origin dev clients (standalone frontends that aren't same-origin)
+
+A same-origin app (frontend served from the same host as its own backend)
+never needs this. A **standalone client that can point at any bench URL at
+runtime** — e.g. a PWA/mobile-shell dev-served on its own port, hitting
+whichever bench URL the user configures — hits three separate same-origin
+assumptions baked into Frappe: REST CORS is off by default, socket.io
+rejects any connection where the `Host` and `Origin` headers resolve to
+different hostnames, and (even past that) `get_site_name()`/`get_url()` in
+`realtime/` derive the socket namespace and an internal auth-check URL from
+`Origin` rather than the real target, which breaks cross-origin regardless.
+
+`examples/enable-cross-origin-dev.sh <bench-dir> <allowed-origin>` patches
+around all three — opt-in only (via an explicit `X-Frappe-Site-Name` header
+the client must send, plus a `disable_socketio_origin_check` config flag),
+so same-origin traffic on the same bench is unaffected either way. Idempotent,
+safe to re-run. Requires a full bench process-group restart afterward (Node
+caches required modules; see the script's own output for the gotcha where
+killing one `bench start` Procfile entry brings down the whole group under
+honcho, not just that entry) and, if the bench predates the doctypes your
+client needs, a `bench migrate`. The client side of the pattern (send
+`X-Frappe-Site-Name`, and list `polling` before `websocket` in the
+transports option — the native browser `WebSocket` API can't carry custom
+headers at all, so listing it first means auth headers never reach the
+server) lives in the consuming frontend's own socket client code, not here.
+
 ---
 
 ## 4. Provisioning
