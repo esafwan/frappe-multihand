@@ -17,7 +17,11 @@ REGISTRY_FILE="${REGISTRY_FILE:-${BENCH_ROOT}/registry.json}"
 DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD:-change-me}"
 DB_ROOT_USER="${DB_ROOT_USER:-root}"
 MARIADB_HOST="${MARIADB_HOST:-mariadb}"
-REDIS_HOST="${REDIS_HOST:-redis}"
+# Left unset by default (not "redis"): the per-role defaults and reference-
+# bench auto-detect logic below need to distinguish "user set REDIS_HOST
+# explicitly" from "nothing set it yet". Only set this yourself for
+# single-Redis setups where one hostname actually resolves for every role.
+REDIS_HOST="${REDIS_HOST:-}"
 WEBSERVER_BASE_PORT="${WEBSERVER_BASE_PORT:-8080}"
 SOCKETIO_BASE_PORT="${SOCKETIO_BASE_PORT:-9000}"
 FILE_WATCHER_BASE_PORT="${FILE_WATCHER_BASE_PORT:-6787}"
@@ -43,12 +47,17 @@ parse_redis_url() {
   echo "${host}:${port}"
 }
 
+# Default per-role Redis hostnames. Many devcontainer compose setups do not
+# publish a plain "redis" service — only role-specific services like
+# "redis-cache" and "redis-queue" resolve via DNS (socketio traffic is
+# typically routed through the queue instance). If REDIS_HOST is set
+# explicitly, it overrides all three roles uniformly (single-Redis setups).
 # If a reference bench exists and REDIS_HOST was not explicitly overridden,
-# inherit its Redis service names and ports. Each disposable bench still gets
-# its own DB index for isolation.
-REDIS_CACHE_HOST="${REDIS_HOST:-redis}"
-REDIS_QUEUE_HOST="${REDIS_HOST:-redis}"
-REDIS_SOCKETIO_HOST="${REDIS_HOST:-redis}"
+# its Redis service names/ports below take precedence over these defaults.
+# Each disposable bench still gets its own DB index for isolation.
+REDIS_CACHE_HOST="${REDIS_HOST:-redis-cache}"
+REDIS_QUEUE_HOST="${REDIS_HOST:-redis-queue}"
+REDIS_SOCKETIO_HOST="${REDIS_HOST:-redis-queue}"
 REDIS_CACHE_PORT=6379
 REDIS_QUEUE_PORT=6379
 REDIS_SOCKETIO_PORT=6379
@@ -56,12 +65,12 @@ if [ -z "${REDIS_HOST:-}" ] && [ -f "${REFERENCE_BENCH_DIR}/sites/common_site_co
   REF_REDIS_CACHE=$(jq -r '.redis_cache // empty' "${REFERENCE_BENCH_DIR}/sites/common_site_config.json")
   REF_REDIS_QUEUE=$(jq -r '.redis_queue // empty' "${REFERENCE_BENCH_DIR}/sites/common_site_config.json")
   REF_REDIS_SOCKETIO=$(jq -r '.redis_socketio // empty' "${REFERENCE_BENCH_DIR}/sites/common_site_config.json")
-  REDIS_CACHE_HOST=$(parse_redis_url "$REF_REDIS_CACHE" | cut -d: -f1)
-  REDIS_CACHE_PORT=$(parse_redis_url "$REF_REDIS_CACHE" | cut -d: -f2)
-  REDIS_QUEUE_HOST=$(parse_redis_url "$REF_REDIS_QUEUE" | cut -d: -f1)
-  REDIS_QUEUE_PORT=$(parse_redis_url "$REF_REDIS_QUEUE" | cut -d: -f2)
-  REDIS_SOCKETIO_HOST=$(parse_redis_url "$REF_REDIS_SOCKETIO" | cut -d: -f1)
-  REDIS_SOCKETIO_PORT=$(parse_redis_url "$REF_REDIS_SOCKETIO" | cut -d: -f2)
+  # Only override a role's default when the reference config actually has
+  # that key. A missing/malformed key must not clobber the good per-role
+  # default above with parse_redis_url's own generic ("redis") fallback.
+  [ -n "$REF_REDIS_CACHE" ] && REDIS_CACHE_HOST=$(parse_redis_url "$REF_REDIS_CACHE" | cut -d: -f1) && REDIS_CACHE_PORT=$(parse_redis_url "$REF_REDIS_CACHE" | cut -d: -f2)
+  [ -n "$REF_REDIS_QUEUE" ] && REDIS_QUEUE_HOST=$(parse_redis_url "$REF_REDIS_QUEUE" | cut -d: -f1) && REDIS_QUEUE_PORT=$(parse_redis_url "$REF_REDIS_QUEUE" | cut -d: -f2)
+  [ -n "$REF_REDIS_SOCKETIO" ] && REDIS_SOCKETIO_HOST=$(parse_redis_url "$REF_REDIS_SOCKETIO" | cut -d: -f1) && REDIS_SOCKETIO_PORT=$(parse_redis_url "$REF_REDIS_SOCKETIO" | cut -d: -f2)
 fi
 
 usage() {
@@ -69,19 +78,35 @@ usage() {
 Usage: $0 --name <bench-name> --branch <branch> --track-dir <track-dir> [options]
 
 Options:
-  --name <name>        Bench name (required)
+  --name <name>        Bench name (required). Prefer 'mh new <name> ...',
+                        which accepts the name positionally and forwards it
+                        here as --name.
   --branch <branch>    Git branch to checkout (required)
   --track-dir <path>   Owning track directory (required)
-  --source-repo <path> Local Git repository used to create the worktree
+  --source-repo <path-or-url>
+                        Local Git repository, or a remote Git URL (https://,
+                        git://, ssh://, or user@host:path). A URL is
+                        equivalent to setting APP_REPO and omitting this
+                        flag: a shared bare clone is kept under
+                        BENCH_ROOT/.sources and re-fetched on every run so
+                        newly pushed branches are visible.
   --worktree <path>    Worktree output path; must be inside --track-dir
   --app <app-name>     Frappe app name (default: APP_NAME env var)
   --from-reference     Restore data from reference bench instead of empty site
   --dry-run            Print actions without executing
   --help               Show this help
 
-APP_REPO may be a Git URL. When --source-repo is omitted for a URL, a bare
-source clone is kept under BENCH_ROOT/.sources and the worktree remains under
-the owning track.
+Environment variables that usually need an explicit override in this
+environment (defaults will fail otherwise):
+  DB_ROOT_PASSWORD   MariaDB root password. Default "change-me" is a
+                     placeholder; find the real value with:
+                       docker inspect -f '{{range .Config.Env}}{{if eq (index (split . "=") 0) "MYSQL_ROOT_PASSWORD"}}{{index (split . "=") 1}}{{end}}{{end}}' <mariadb-container>
+  REDIS_HOST         Redis service hostname for ALL roles (cache/queue/
+                     socketio). Only set this for single-Redis setups where
+                     "redis" (or your chosen name) actually resolves. Left
+                     unset, cache defaults to "redis-cache" and
+                     queue/socketio default to "redis-queue" — the service
+                     names used by this project's devcontainer.
 EOF
 }
 
@@ -162,8 +187,26 @@ if ! path_is_inside "$WORKTREE" "$TRACK_DIR"; then
   exit 1
 fi
 
+# --source-repo accepts either a local filesystem path or a remote Git URL
+# (https://, git://, ssh://, or scp-like user@host:path). A URL passed here
+# is equivalent to setting APP_REPO and omitting --source-repo.
+looks_like_git_url() {
+  case "$1" in
+    *://*) return 0 ;;
+    *@*:*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+if [ -n "$SOURCE_REPO" ] && [ ! -d "$SOURCE_REPO" ] && looks_like_git_url "$SOURCE_REPO"; then
+  APP_REPO="$SOURCE_REPO"
+  SOURCE_REPO=""
+fi
+
 # Resolve or create a private source repository. A local source checkout is
 # only used as the worktree source; it is never mounted into the bench.
+# A remote APP_REPO is mirrored once into a shared bare clone under
+# BENCH_ROOT/.sources and reused/fetched on every subsequent provision, so a
+# branch pushed after the first provisioning run is still visible.
 if [ -z "$SOURCE_REPO" ]; then
   if [ -n "$APP_REPO" ] && [ -d "$APP_REPO" ]; then
     SOURCE_REPO="$APP_REPO"
@@ -176,9 +219,19 @@ if [ -z "$SOURCE_REPO" ]; then
         mkdir -p "$(dirname "$SOURCE_REPO")"
         git clone --bare "$APP_REPO" "$SOURCE_REPO"
       fi
+    else
+      # Fetch into refs/remotes/origin/*, never directly into refs/heads/*:
+      # other disposable benches may have this shared bare clone's branches
+      # checked out live in their own worktrees, and Git refuses to fetch
+      # into a ref that is checked out elsewhere. The branch-resolution step
+      # below already falls back to refs/remotes/origin/$BRANCH (creating a
+      # fresh local branch) when refs/heads/$BRANCH doesn't exist yet, so a
+      # branch pushed after the clone was created is still picked up.
+      log "Refreshing shared source clone: $SOURCE_REPO"
+      dry git -C "$SOURCE_REPO" fetch origin '+refs/heads/*:refs/remotes/origin/*' --prune
     fi
   else
-    echo "ERROR: --source-repo or APP_REPO is required" >&2
+    echo "ERROR: --source-repo (local path or Git URL) or APP_REPO is required" >&2
     exit 1
   fi
 fi
@@ -219,9 +272,6 @@ log "Provisioning bench '$NAME' (branch: $BRANCH, app: $APP)"
 log "  track: $TRACK_DIR"
 log "  worktree: $WORKTREE"
 log "  source: $SOURCE_REPO"
-log "  ports: web=$WEB_PORT socketio=$SOCK_PORT watcher=$WATCH_PORT"
-log "  redis: cache=${REDIS_CACHE_HOST}:${REDIS_CACHE_PORT}/${REDIS_CACHE_DB} queue=${REDIS_QUEUE_HOST}:${REDIS_QUEUE_PORT}/${REDIS_QUEUE_DB} socketio=${REDIS_SOCKETIO_HOST}:${REDIS_SOCKETIO_PORT}/${REDIS_SOCKETIO_DB}"
-log "  db: $DB_NAME / $DB_USER"
 
 if [ "$DRY_RUN" = false ]; then
   if jq -e --arg name "$NAME" '.benches[$name]' "$REGISTRY_FILE" >/dev/null 2>&1; then
@@ -231,6 +281,25 @@ if [ "$DRY_RUN" = false ]; then
       echo "ERROR: bench '$NAME' already exists with a different worktree" >&2
       exit 1
     }
+    # A resumed provision must use the resource allocation recorded in its
+    # provisioning intent. Recomputing the DB password, Redis DB indexes, or
+    # ports here would desynchronize the registry from the MariaDB user,
+    # Redis config, and site config already created by the earlier attempt.
+    existing_db_password=$(jq -r --arg name "$NAME" '.benches[$name].database.db_password // empty' "$REGISTRY_FILE")
+    [ -n "$existing_db_password" ] && DB_PASSWORD="$existing_db_password"
+    existing_cache_db=$(jq -r --arg name "$NAME" '.benches[$name].redis.cache_db // empty' "$REGISTRY_FILE")
+    existing_queue_db=$(jq -r --arg name "$NAME" '.benches[$name].redis.queue_db // empty' "$REGISTRY_FILE")
+    existing_socketio_db=$(jq -r --arg name "$NAME" '.benches[$name].redis.socketio_db // empty' "$REGISTRY_FILE")
+    [ -n "$existing_cache_db" ] && REDIS_CACHE_DB="$existing_cache_db"
+    [ -n "$existing_queue_db" ] && REDIS_QUEUE_DB="$existing_queue_db"
+    [ -n "$existing_socketio_db" ] && REDIS_SOCKETIO_DB="$existing_socketio_db"
+    existing_web_port=$(jq -r --arg name "$NAME" '.benches[$name].ports.webserver // empty' "$REGISTRY_FILE")
+    existing_socketio_port=$(jq -r --arg name "$NAME" '.benches[$name].ports.socketio // empty' "$REGISTRY_FILE")
+    existing_watcher_port=$(jq -r --arg name "$NAME" '.benches[$name].ports.file_watcher // empty' "$REGISTRY_FILE")
+    [ -n "$existing_web_port" ] && WEB_PORT="$existing_web_port"
+    [ -n "$existing_socketio_port" ] && SOCK_PORT="$existing_socketio_port"
+    [ -n "$existing_watcher_port" ] && WATCH_PORT="$existing_watcher_port"
+    log "Resuming existing provisioning intent for '$NAME'"
   else
     TMP=$(mktemp)
     jq --arg name "$NAME" \
@@ -267,6 +336,10 @@ if [ "$DRY_RUN" = false ]; then
   fi
 fi
 flock -u 200
+
+log "  ports: web=$WEB_PORT socketio=$SOCK_PORT watcher=$WATCH_PORT"
+log "  redis: cache=${REDIS_CACHE_HOST}:${REDIS_CACHE_PORT}/${REDIS_CACHE_DB} queue=${REDIS_QUEUE_HOST}:${REDIS_QUEUE_PORT}/${REDIS_QUEUE_DB} socketio=${REDIS_SOCKETIO_HOST}:${REDIS_SOCKETIO_PORT}/${REDIS_SOCKETIO_DB}"
+log "  db: $DB_NAME / $DB_USER"
 
 WORKTREE_CREATED=false
 cleanup_partial() {
@@ -308,6 +381,13 @@ else
   dry bench init --frappe-branch "$FRAPPE_BRANCH" "$BENCH_DIR"
 fi
 
+# All bench subcommands below (pip install, set-config, new-site, ...) must
+# run with cwd inside the bench root, or `bench` cannot locate env/bin/python
+# and fails with "No virtual environment ... found for path env/bin/python".
+if [ "$DRY_RUN" = false ]; then
+  cd "$BENCH_DIR"
+fi
+
 mkdir -p "$BENCH_DIR/apps"
 APP_PATH="$BENCH_DIR/apps/$APP"
 if [ -e "$APP_PATH" ] || [ -L "$APP_PATH" ]; then
@@ -322,14 +402,27 @@ if [ -e "$APP_PATH" ] || [ -L "$APP_PATH" ]; then
   }
 else
   dry git clone --branch "$BRANCH" --single-branch "$SOURCE_REPO" "$APP_PATH"
-  
+
   if [ "$DRY_RUN" = false ]; then
-    echo "$APP" >> "$BENCH_DIR/sites/apps.txt"
+    APPS_TXT="$BENCH_DIR/sites/apps.txt"
+    # bench init does not guarantee apps.txt ends in a newline; appending
+    # without checking corrupts it into a single concatenated line (e.g.
+    # "frappehuf"), which breaks every subsequent bench command with
+    # ModuleNotFoundError.
+    if [ -s "$APPS_TXT" ] && [ -n "$(tail -c1 "$APPS_TXT")" ]; then
+      printf '\n' >> "$APPS_TXT"
+    fi
+    if ! grep -qxF "$APP" "$APPS_TXT" 2>/dev/null; then
+      printf '%s\n' "$APP" >> "$APPS_TXT"
+    fi
   fi
-  dry bench pip install -e "$APP_PATH"
 fi
 
-cd "$BENCH_DIR"
+# Install the app's Python package unconditionally: idempotent, and required
+# on every retry, not just a truly fresh clone. A prior partial/failed run
+# can leave apps/$APP present without ever having pip-installed it, which
+# then silently skips this step forever (ModuleNotFoundError at runtime).
+dry bench pip install -e "$APP_PATH"
 
 # Configure
 dry bench set-config -g db_host "$MARIADB_HOST"
@@ -352,6 +445,16 @@ fi
 
 # Create DB/user
 if [ "$DRY_RUN" = false ]; then
+  if ! mariadb -h "$MARIADB_HOST" -u "$DB_ROOT_USER" -p"$DB_ROOT_PASSWORD" -e "SELECT 1;" >/dev/null 2>&1; then
+    cat >&2 <<EOF
+ERROR: cannot authenticate to MariaDB at ${MARIADB_HOST} as ${DB_ROOT_USER}.
+DB_ROOT_PASSWORD is unset or wrong (currently defaults to the placeholder
+"change-me" unless overridden). Find the real password from the host with:
+  docker inspect -f '{{range .Config.Env}}{{if eq (index (split . "=") 0) "MYSQL_ROOT_PASSWORD"}}{{index (split . "=") 1}}{{end}}{{end}}' <mariadb-container-name>
+then re-run with DB_ROOT_PASSWORD=<password> in the environment.
+EOF
+    exit 1
+  fi
   mariadb -h "$MARIADB_HOST" -u "$DB_ROOT_USER" -p"$DB_ROOT_PASSWORD" <<SQL
 CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER IF NOT EXISTS '${DB_USER}'@'%' IDENTIFIED BY '${DB_PASSWORD}';
@@ -371,7 +474,8 @@ else
     --mariadb-root-password "$DB_ROOT_PASSWORD" \
     --admin-password "$ADMIN_PASSWORD" \
     --db-name "$DB_NAME" \
-    --db-password "$DB_PASSWORD"
+    --db-password "$DB_PASSWORD" \
+    --force
 fi
 
 if [ "$FROM_REFERENCE" = true ]; then

@@ -225,7 +225,7 @@ fi
 
 Replace `REDIS_CACHE_DB`, `REDIS_QUEUE_DB`, `REDIS_SOCKETIO_DB` with per-bench Redis DB indexes. The service name `redis` above is illustrative; match the actual service name in your compose file (common alternatives are `redis-cache`, `redis-queue`, `redis-socketio`, or a single `redis`).
 
-The example `examples/provision.sh` does this automatically: if `REDIS_HOST` is not set explicitly, it parses `redis_cache`, `redis_queue`, and `redis_socketio` from the reference bench's `sites/common_site_config.json` and reuses those service names/ports, appending the newly allocated DB index for isolation.
+The example `examples/provision.sh` does this automatically. If `REDIS_HOST` is left unset, cache defaults to `redis-cache` and queue/socketio default to `redis-queue` (many devcontainer compose setups do not publish a plain `redis` service, so that name will not resolve). Setting `REDIS_HOST` explicitly overrides all three roles uniformly, for single-Redis setups where a shared name does resolve. If a reference bench exists and `REDIS_HOST` was not set, its `sites/common_site_config.json` `redis_cache`/`redis_queue`/`redis_socketio` values take precedence over either default, reusing those service names/ports and appending the newly allocated DB index for isolation. `examples/teardown.sh` uses the same per-role defaults for its Redis flush step.
 
 Per-site config example:
 
@@ -378,6 +378,16 @@ bench new-site "${SITE_NAME}" \
 # 7. Install app(s).
 bench --site "${SITE_NAME}" install-app "${APP_NAME}"
 
+# 7a. Build frontend assets AND sync the sites/assets symlink. `yarn build`
+#     (or `npm run build`) inside an app's frontend/ only writes the bundle
+#     into that app's own public/ folder — it does NOT create or refresh
+#     sites/assets/<app>, which is what Frappe actually serves /assets/<app>/...
+#     from. Skipping this step is silent: the site responds fine on
+#     /api/method/ping, but every frontend page 404s on its own JS bundle.
+#     Run this from the bench root after any app install/update whose
+#     frontend changed, not just once at provision time:
+bench build --app "${APP_NAME}"
+
 # 8. Mark registry status "ready" and run health check.
 # 9. Write BENCH_IDENTITY.md to the bench root (see 4.8).
 ```
@@ -447,6 +457,19 @@ for i in {1..60}; do
 done
 
 # If the loop expires, capture logs and roll back.
+```
+
+`/api/method/ping` only proves the backend responds — it says nothing about the
+frontend, since Frappe answers it before ever touching `sites/assets`. A bench
+can report READY here while every page is a blank screen full of 404s (see 4.4
+step 7a). If the app under test has a frontend, extend the health check to
+fetch the app shell and confirm the JS bundle it references is actually served:
+
+```bash
+SHELL_HTML=$(curl -fsS "http://127.0.0.1:${WEBSERVER_PORT}/${APP_ROUTE}")   # e.g. APP_ROUTE=huf
+BUNDLE_URL=$(grep -oE '/assets/[^"]+\.js' <<<"$SHELL_HTML" | head -1)
+curl -fsS -o /dev/null -w "%{http_code}\n" "http://127.0.0.1:${WEBSERVER_PORT}${BUNDLE_URL}"
+# must print 200, not 404 — a 404 here means `bench build` was never run
 ```
 
 Save the `BENCH_PID` in the registry (or the process group ID) so teardown can stop the bench.
@@ -900,13 +923,13 @@ Configuration points you must set before using the templates:
 | `REFERENCE_BENCH_NAME` | `reference` | Name of the protected reference bench |
 | `REFERENCE_BENCH_DIR` | `${BENCH_ROOT}/${REFERENCE_BENCH_NAME}` | Path to reference bench |
 | `REFERENCE_SITE` | `main.local` | Primary site in the reference bench |
-| `DB_ROOT_PASSWORD` | `secret` | MariaDB root password |
+| `DB_ROOT_PASSWORD` | `secret` | MariaDB root password. **No safe default exists** — the placeholder `change-me` will fail authentication in any real environment. provision.sh/teardown.sh now fail fast with the `docker inspect` command to find the real value (see §8.7) rather than failing deep inside `bench new-site` |
 | `WEBSERVER_BASE_PORT` | `8080` | Base for disposable webserver ports |
 | `SOCKETIO_BASE_PORT` | `9000` | Base for disposable socketio ports |
 | `FILE_WATCHER_BASE_PORT` | `6787` | Base for disposable file-watcher ports |
-| `REDIS_HOST` | `redis` | Shared Redis service hostname |
-| `APP_REPO` | `git@github.com:org/app.git` | App repository URL |
-| `SOURCE_REPO` | `/path/to/app-repo` | Local Git repository used to create the track worktree and bench branch checkout |
+| `REDIS_HOST` | unset | Shared Redis service hostname for **all** roles. Only set this if a single shared name (e.g. `redis`) actually resolves in your environment. Left unset, cache defaults to `redis-cache` and queue/socketio default to `redis-queue` |
+| `APP_REPO` | `git@github.com:org/app.git` | App repository URL. Equivalent to passing a URL directly to `--source-repo` |
+| `SOURCE_REPO` / `--source-repo` | `/path/to/app-repo` or a Git URL | Local Git repository, or a remote URL (`https://`, `git://`, `ssh://`, `user@host:path`) used to create the track worktree and bench branch checkout. A URL creates/reuses a shared bare clone under `BENCH_ROOT/.sources`, re-fetched on every provision so newly pushed branches are visible |
 | `APP_NAME` | `myapp` | Frappe app name |
 | `TRACK_DIR` | `/path/to/Tracks/owner.Feature` | Owning track directory; all development worktrees must live below it |
 | `SIGNED_BY` | `claude` | Agent or human identity creating the bench (`claude`, `agy`, `codex`, `kimi`, `human`, etc.) |

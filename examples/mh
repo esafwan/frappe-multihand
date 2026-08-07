@@ -80,7 +80,15 @@ require_script() {
 
 cmd_new() {
   require_script "$PROVISION_SCRIPT"
-  exec "$PROVISION_SCRIPT" "$@"
+  # Accept a leading positional bench name (as documented in SKILL.md's
+  # usage examples) and translate it to provision.sh's required --name flag.
+  local args=()
+  if [ $# -gt 0 ] && [[ "$1" != --* ]]; then
+    args+=(--name "$1")
+    shift
+  fi
+  args+=("$@")
+  exec "$PROVISION_SCRIPT" "${args[@]}"
 }
 
 cmd_list() {
@@ -207,7 +215,13 @@ cmd_logs() {
 
 cmd_teardown() {
   require_script "$TEARDOWN_SCRIPT"
-  exec "$TEARDOWN_SCRIPT" "$@"
+  local args=()
+  if [ $# -gt 0 ] && [[ "$1" != --* ]]; then
+    args+=(--name "$1")
+    shift
+  fi
+  args+=("$@")
+  exec "$TEARDOWN_SCRIPT" "${args[@]}"
 }
 
 cmd_audit() {

@@ -13,7 +13,12 @@ REGISTRY_FILE="${REGISTRY_FILE:-${BENCH_ROOT}/registry.json}"
 DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD:-change-me}"
 DB_ROOT_USER="${DB_ROOT_USER:-root}"
 MARIADB_HOST="${MARIADB_HOST:-mariadb}"
-REDIS_HOST="${REDIS_HOST:-redis}"
+# Matches provision.sh's per-role defaults: many devcontainer compose setups
+# do not publish a plain "redis" service. REDIS_HOST, if set, overrides all
+# three roles uniformly (single-Redis setups).
+REDIS_CACHE_HOST="${REDIS_HOST:-redis-cache}"
+REDIS_QUEUE_HOST="${REDIS_HOST:-redis-queue}"
+REDIS_SOCKETIO_HOST="${REDIS_HOST:-redis-queue}"
 SIGNED_BY="${SIGNED_BY:-${USER:-unknown}}"
 DRY_RUN=false
 # =======================================================
@@ -135,19 +140,29 @@ fi
 
 # Drop database and user
 if [ "$DRY_RUN" = false ]; then
+  if ! mariadb -h "$MARIADB_HOST" -u "$DB_ROOT_USER" -p"$DB_ROOT_PASSWORD" -e "SELECT 1;" >/dev/null 2>&1; then
+    cat >&2 <<EOF
+ERROR: cannot authenticate to MariaDB at ${MARIADB_HOST} as ${DB_ROOT_USER}.
+DB_ROOT_PASSWORD is unset or wrong (currently defaults to the placeholder
+"change-me" unless overridden). Find the real password from the host with:
+  docker inspect -f '{{range .Config.Env}}{{if eq (index (split . "=") 0) "MYSQL_ROOT_PASSWORD"}}{{index (split . "=") 1}}{{end}}{{end}}' <mariadb-container-name>
+then re-run with DB_ROOT_PASSWORD=<password> in the environment.
+EOF
+    exit 1
+  fi
   mariadb -h "$MARIADB_HOST" -u "$DB_ROOT_USER" -p"$DB_ROOT_PASSWORD" \
     -e "DROP DATABASE IF EXISTS \`${DB_NAME}\`; DROP USER IF EXISTS '${DB_USER}'@'%'; FLUSH PRIVILEGES;"
 else
   echo "[DRY-RUN] would drop database $DB_NAME and user $DB_USER"
 fi
 
-# Flush Redis DBs
+# Flush Redis DBs (each role may live on a different host)
 if [ "$DRY_RUN" = false ]; then
-  for db in "$REDIS_CACHE_DB" "$REDIS_QUEUE_DB" "$REDIS_SOCKETIO_DB"; do
-    redis-cli -h "$REDIS_HOST" -n "$db" FLUSHDB
-  done
+  redis-cli -h "$REDIS_CACHE_HOST" -n "$REDIS_CACHE_DB" FLUSHDB
+  redis-cli -h "$REDIS_QUEUE_HOST" -n "$REDIS_QUEUE_DB" FLUSHDB
+  redis-cli -h "$REDIS_SOCKETIO_HOST" -n "$REDIS_SOCKETIO_DB" FLUSHDB
 else
-  echo "[DRY-RUN] would flush redis DBs $REDIS_CACHE_DB $REDIS_QUEUE_DB $REDIS_SOCKETIO_DB"
+  echo "[DRY-RUN] would flush redis DBs: cache=${REDIS_CACHE_HOST}/${REDIS_CACHE_DB} queue=${REDIS_QUEUE_HOST}/${REDIS_QUEUE_DB} socketio=${REDIS_SOCKETIO_HOST}/${REDIS_SOCKETIO_DB}"
 fi
 
 # Remove bench directory
