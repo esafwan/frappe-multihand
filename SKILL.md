@@ -100,6 +100,23 @@ Typical reasons:
 
 Do **not** use this for production multi-tenancy. Disposable benches are intentionally short-lived and co-located; the isolation model is pragmatic, not hardened.
 
+### When you can skip this skill entirely
+
+This skill governs bench **lifecycle**: create, list/audit, tear down. It is not the
+reference for "how do I use a bench that already exists." If you've been handed a
+bench path directly, or you're resuming a track that already has one, you almost
+certainly don't need to invoke this skill at all:
+
+- **`BENCH_IDENTITY.md` at the bench root** (written by `provision.sh`, see §4.8) has
+  the bench's identity, ports, container, and any bench-specific gotchas.
+- **The owning track's `CONTEXT.md`** (if the bench was provisioned for a specific
+  track) usually has this too, often with more up-to-date restart commands and
+  gotchas discovered mid-task than `BENCH_IDENTITY.md` was written with.
+
+Read one of those and go straight to `bench`/`docker exec` commands. Only come back
+to *this* skill when the task is actually lifecycle work — provisioning a new bench,
+listing/auditing what exists, or tearing one down.
+
 ---
 
 ## 2. First-run detection and reference-bench selection
