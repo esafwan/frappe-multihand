@@ -14,6 +14,51 @@ metadata:
 
 # frappe-multihand
 
+## STOP — run the script, do not hand-roll the steps
+
+**This skill ships working scripts. Use them. Do not write your own provisioning
+commands from the snippets further down this file.**
+
+To create a bench, the ONLY supported action is:
+
+```bash
+provision.sh --name <bench> --branch <branch> --track-dir <dir> --app <app> --source-repo <repo>
+```
+
+(or `mh new <bench> --branch <branch> --track-dir <dir>`, which wraps it).
+
+Everything below section 1 is **background and rationale for reading the scripts**,
+not a recipe to follow by hand. In particular, the numbered command blocks in
+**section 4.4 are illustrative and deliberately incomplete** — they are there to
+explain what `provision.sh` does, not to be copied. Hand-copying them silently
+omits at least:
+
+- `bench pip install -e apps/<app>` and the `sites/apps.txt` append — without these
+  `bench install-app` and `bench build` fail with `ModuleNotFoundError: No module
+  named '<app>'` **after** the slow `bench init` has already completed;
+- the locked registry write, so the bench is invisible to `mh audit`/`mh list` and
+  its ports are not reserved against the next allocator;
+- `BENCH_IDENTITY.md`, so the next agent that finds the directory cannot tell what
+  it is or whether it is safe to tear down.
+
+### If the scripts are not where you can run them
+
+That is a setup problem to fix, **not** a reason to hand-roll. In order:
+
+1. `examples/*.sh` and `mh` live in this skill directory. Copy them to a path the
+   bench host can execute (for a devcontainer, somewhere under the mounted
+   workspace) and run them there.
+2. `--track-dir` must be a path **visible to the bench host**. If your track lives
+   outside the mount, create a host-visible track dir and pass that; do not skip
+   the flag.
+3. `--source-repo` accepts a local path, a bare clone, or a URL. A bare clone
+   already on the bench host is the fastest option.
+
+If you have gone three steps down a path that is not "run provision.sh", stop and
+re-read this block.
+
+---
+
 **Trigger phrases:**
 
 - "create a disposable frappe bench"
@@ -341,6 +386,14 @@ Store the registry in one place, e.g. `${BENCH_ROOT}/registry.json` or `${BENCH_
 
 ### 4.4 Fresh empty site mode
 
+> **These commands are an explanation of `provision.sh`, not a script to run.**
+> They are incomplete on purpose — notably they show `git clone` into `apps/`
+> without the `bench pip install -e apps/<app>` and `sites/apps.txt` append that
+> must follow it, and without any registry or `BENCH_IDENTITY.md` write. Copying
+> this block produces a bench that fails at `install-app` with
+> `ModuleNotFoundError` after `bench init` has already burned several minutes,
+> and that no `mh` command can see. Run `provision.sh`.
+
 Steps for a brand-new empty site:
 
 ```bash
@@ -383,6 +436,20 @@ bench set-config -g developer_mode 1
 # Force them to match immediately after set-config, every time:
 sd '--port \d+' "--port ${WEBSERVER_PORT}" Procfile
 grep -n '^\(web\|socketio\):' Procfile   # confirm both ports before starting
+
+# 4c. `bench init` also seeds `redis_cache:`/`redis_queue:` Procfile entries
+# that spawn LOCAL Redis processes on fixed ports (6381/6383 by default).
+# This skill's model is always shared Redis containers (§3.3) — step 4
+# above already points the site at them — so these entries are never
+# wanted: left in place, they collide with any other bench's local Redis on
+# the same host and crash the whole `honcho` process group on `bench
+# start` (the *other* processes get SIGTERM'd too, not just redis_cache).
+# Strip them:
+sd -f m '^redis_cache:.*\n' '' Procfile   # or: grep -v '^redis_cache:\|^redis_queue:' Procfile > Procfile.new && mv Procfile.new Procfile
+
+# 4b and 4c are both applied automatically by examples/provision.sh
+# (idempotent, right after `bench init`) — this section documents *why*,
+# not a step you need to run by hand when using the real script.
 
 # 5. Create MariaDB user and database.
 # Use `mariadb` (or `mysql` on older images) as the client command.

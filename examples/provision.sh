@@ -388,6 +388,25 @@ if [ "$DRY_RUN" = false ]; then
   cd "$BENCH_DIR"
 fi
 
+# `bench init` seeds Procfile with its own default web port, independent of
+# the registry-assigned $WEB_PORT set via `bench set-config` below — the two
+# are separate files and set-config alone does not touch Procfile. Left
+# unfixed, the bench serves on the wrong port and whichever bench starts
+# second on that stale port silently steals it from another bench. It also
+# seeds `redis_cache:`/`redis_queue:` process entries that spawn LOCAL Redis
+# on fixed ports (6381/6383 by default), which collides with any other
+# bench's local Redis on the same host and crashes the whole `honcho`
+# process group on `bench start`. This skill's model is always shared
+# Redis containers (§3.3) — the site is already pointed at
+# ${REDIS_CACHE_HOST}/${REDIS_QUEUE_HOST} above — so these local-Redis
+# Procfile entries are never wanted here; strip them. Both fixes are
+# idempotent (safe to re-run on an existing bench).
+if [ "$DRY_RUN" = false ] && [ -f "$BENCH_DIR/Procfile" ]; then
+  sed -i.bak -E "/^web:/ s/--port [0-9]+/--port ${WEB_PORT}/" "$BENCH_DIR/Procfile"
+  sed -i.bak -E '/^redis_cache:/d; /^redis_queue:/d' "$BENCH_DIR/Procfile"
+  rm -f "$BENCH_DIR/Procfile.bak"
+fi
+
 mkdir -p "$BENCH_DIR/apps"
 APP_PATH="$BENCH_DIR/apps/$APP"
 if [ -e "$APP_PATH" ] || [ -L "$APP_PATH" ]; then
