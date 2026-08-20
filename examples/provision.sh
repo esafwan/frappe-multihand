@@ -421,7 +421,7 @@ if [ "$DRY_RUN" = false ]; then
           worktree: $worktree, track_dir: $track, source_repo: $source,
           worktree_managed: true, app_name: $app,
           bench_app_checkout: ($path + "/apps/" + $app),
-          apps: [{name: $app, role: "primary", branch: $branch, source: $source}] + $extra_apps,
+          apps: ([{name: $app, role: "primary", branch: $branch, source: $source}] + $extra_apps),
           purpose: "Provisioned by provision.sh",
           ports: {webserver: $web, socketio: $sock, file_watcher: $watch},
           redis: {cache_db: $cache, queue_db: $queue, socketio_db: $socket},

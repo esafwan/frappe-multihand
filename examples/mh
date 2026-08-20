@@ -183,19 +183,27 @@ resolve_workspace_args() {
   fi
 }
 
-cmd_new() {
-  require_script "$PROVISION_SCRIPT"
-  # Accept a leading positional bench name (as documented in SKILL.md's
-  # usage examples) and translate it to provision.sh's required --name flag.
-  local args=()
+# Shared by cmd_new and cmd_reference_create: parse a leading positional name
+# plus --workspace out of "$@", resolve the workspace manifest (if any) into
+# provision.sh flags, and set the caller's own NEW_ARGS/NEW_REF/
+# NEW_FRAPPE_BRANCH arrays/vars (bash has no return-by-value for arrays, so
+# this is the usual "caller pre-declares locals, callee assigns them" idiom
+# — every caller below declares NEW_ARGS/NEW_REF/NEW_FRAPPE_BRANCH as local
+# before calling this). Does not export anything and does not exec —
+# callers decide what to do with the resolved reference bench name, since
+# `mh reference create` deliberately must NOT export it (see that function's
+# comment for why: creating a bench literally named the workspace's own
+# reference_bench would otherwise trip provision.sh's own protective guard).
+_resolve_new_args() {
+  NEW_ARGS=()
+  NEW_REF=""
+  NEW_FRAPPE_BRANCH=""
+
   if [ $# -gt 0 ] && [[ "$1" != --* ]]; then
-    args+=(--name "$1")
+    NEW_ARGS+=(--name "$1")
     shift
   fi
 
-  # Pull out --workspace (provision.sh itself is workspace-agnostic — it
-  # only ever sees the resolved --app/--extra-app/--run-after-install flags;
-  # see SKILL.md §4.4a for why resolution lives here, not in provision.sh).
   local workspace="" remaining=()
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -204,7 +212,6 @@ cmd_new() {
     esac
   done
 
-  local resolved_ref="" resolved_frappe_branch=""
   if [ -n "$workspace" ]; then
     require_command jq
     local resolved=()
@@ -218,24 +225,29 @@ cmd_new() {
       # absolute literal path can't be written instead).
       line="${line//\$\{BENCH_ROOT\}/$BENCH_ROOT}"
       case "$line" in
-        __REFERENCE_BENCH_NAME__=*) resolved_ref="${line#__REFERENCE_BENCH_NAME__=}" ;;
-        __FRAPPE_BRANCH__=*) resolved_frappe_branch="${line#__FRAPPE_BRANCH__=}" ;;
+        __REFERENCE_BENCH_NAME__=*) NEW_REF="${line#__REFERENCE_BENCH_NAME__=}" ;;
+        __FRAPPE_BRANCH__=*) NEW_FRAPPE_BRANCH="${line#__FRAPPE_BRANCH__=}" ;;
         *) resolved+=("$line") ;;
       esac
-    done < <(resolve_workspace_args "$workspace") || exit 1
+    done < <(resolve_workspace_args "$workspace") || return 1
     # Manifest-derived flags first, then the caller's own flags appended
     # after — provision.sh's flag parser is last-wins for single-value
     # flags, so an explicit --app/--branch the caller passed still overrides
     # the manifest default; --extra-app/--run-after-install are repeatable
     # so both sets simply accumulate.
-    args+=("${resolved[@]}" "${remaining[@]}")
+    NEW_ARGS+=("${resolved[@]}" "${remaining[@]}")
   else
-    args+=("${remaining[@]}")
+    NEW_ARGS+=("${remaining[@]}")
   fi
+}
 
-  [ -n "$resolved_ref" ] && export REFERENCE_BENCH_NAME="$resolved_ref"
-  [ -n "$resolved_frappe_branch" ] && export FRAPPE_BRANCH="$resolved_frappe_branch"
-  exec "$PROVISION_SCRIPT" "${args[@]}"
+cmd_new() {
+  require_script "$PROVISION_SCRIPT"
+  local NEW_ARGS=() NEW_REF="" NEW_FRAPPE_BRANCH=""
+  _resolve_new_args "$@" || exit 1
+  [ -n "$NEW_REF" ] && export REFERENCE_BENCH_NAME="$NEW_REF"
+  [ -n "$NEW_FRAPPE_BRANCH" ] && export FRAPPE_BRANCH="$NEW_FRAPPE_BRANCH"
+  exec "$PROVISION_SCRIPT" "${NEW_ARGS[@]}"
 }
 
 cmd_list() {
@@ -470,17 +482,23 @@ cmd_reference_create() {
   local track_dir="${BENCH_ROOT}/.reference-tracks/${name}"
   mkdir -p "$track_dir"
 
-  local new_args=("$name" --workspace "$workspace" --track-dir "$track_dir")
-  [ "$blank" = true ] && new_args+=(--blank)
-  [ "$dry_run" = true ] && new_args+=(--dry-run)
-
-  # This does NOT restore --from-reference (that would need another
-  # reference bench to already exist for this workspace, which is exactly
-  # what we're creating) — --blank unless a follow-up `mh reference refresh`
-  # seeds it, matching §3.2.1's "reseed after the fact" model.
-  new_args+=(--blank)
-
-  cmd_new "${new_args[@]}"
+  # Resolve via _resolve_new_args directly rather than calling cmd_new: (a)
+  # cmd_new execs provision.sh, which replaces this whole process — nothing
+  # after that call would ever run, including the persistent-marking step
+  # below; (b) cmd_new exports REFERENCE_BENCH_NAME from the workspace
+  # manifest unconditionally, but here that resolves to this bench's own
+  # $name (we're creating the very reference the workspace points at) —
+  # exporting it would make provision.sh's own protective guard refuse to
+  # provision over "itself". Neither is wanted for this command: the create
+  # step always passes --blank (see below), so REFERENCE_BENCH_NAME is
+  # irrelevant to what actually gets restored, and this command needs to
+  # keep running after provision.sh returns.
+  local create_argv=("$name" --workspace "$workspace" --track-dir "$track_dir" --blank)
+  [ "$dry_run" = true ] && create_argv+=(--dry-run)
+  local NEW_ARGS=() NEW_REF="" NEW_FRAPPE_BRANCH=""
+  _resolve_new_args "${create_argv[@]}" || exit 1
+  [ -n "$NEW_FRAPPE_BRANCH" ] && export FRAPPE_BRANCH="$NEW_FRAPPE_BRANCH"
+  "$PROVISION_SCRIPT" "${NEW_ARGS[@]}"
 
   if [ "$dry_run" = false ]; then
     local lock_file="${BENCH_ROOT}/.registry.lock"
