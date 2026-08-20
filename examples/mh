@@ -8,7 +8,7 @@
 #   mh <command> [args]
 #
 # Commands:
-#   new <name> --branch <branch> --track-dir <dir> [--source-repo <repo>] [--app <app>] [--from-reference] [--dry-run]
+#   new <name> --branch <branch> --track-dir <dir> [--source-repo <repo>] [--app <app>] [--blank] [--dry-run]  # restores from reference by default
 #   list [--json]
 #   testplan <name> [--output <file>]
 #   open <name>
@@ -27,6 +27,17 @@ PROVISION_SCRIPT="${PROVISION_SCRIPT:-${SCRIPT_DIR}/provision.sh}"
 TEARDOWN_SCRIPT="${TEARDOWN_SCRIPT:-${SCRIPT_DIR}/teardown.sh}"
 LIST_SCRIPT="${LIST_SCRIPT:-${SCRIPT_DIR}/list.sh}"
 AUDIT_SCRIPT="${AUDIT_SCRIPT:-${SCRIPT_DIR}/audit.sh}"
+REGISTRY_FILE="${REGISTRY_FILE:-${BENCH_ROOT}/registry.json}"
+# Declared, read-mostly config — NOT bench state. Never written to by
+# provision.sh/teardown.sh/audit.sh; only `mh reference` writes here, and
+# only to add/update a workspace's own manifest entry, never bench-runtime
+# fields (those live in registry.json, which is lock-protected bench state).
+WORKSPACES_FILE="${WORKSPACES_FILE:-${BENCH_ROOT}/workspaces.json}"
+# How many `type: persistent` benches (reference benches, mainly) `mh
+# reference create` will allow before refusing — a cheap guard against
+# reference-bench sprawl on a shared, memory-constrained host. Override for
+# a host that's known to have room for more.
+MH_MAX_PERSISTENT="${MH_MAX_PERSISTENT:-4}"
 # =======================================================
 
 usage() {
@@ -36,8 +47,17 @@ mh — frappe-multihand helper CLI
 Usage: mh <command> [args]
 
 Commands:
-  new <name> --branch <branch> --track-dir <dir> [--source-repo <repo>] [--app <app>] [--from-reference] [--dry-run]
+  new <name> --branch <branch> --track-dir <dir> [--source-repo <repo>] [--app <app>] [--blank] [--dry-run]  # restores from reference by default
       Create a development worktree and a separate branch checkout in a disposable bench.
+
+  new <name> --workspace <workspace> --branch <branch> --track-dir <dir> [--dry-run]
+      Same, but the app list, dependency branches, and reference bench are
+      resolved from workspaces.json's "<workspace>" entry instead of being
+      passed by hand. --branch overrides the manifest's primary-app branch;
+      every other --app/--extra-app/--run-after-install flag is expanded
+      from the manifest and forwarded to provision.sh. --dry-run alone
+      (without actually provisioning) is a good way to see exactly what a
+      workspace resolves to before running it for real.
 
   list [--json]
       List registered benches.
@@ -63,6 +83,29 @@ Commands:
   doctor
       Check environment prerequisites.
 
+  reference list
+      List every persistent (type: "persistent") bench in the registry,
+      with what dataset it holds (reference_dataset) and which workspaces
+      point at it.
+
+  reference create <name> --workspace <workspace> [--blank] [--dry-run]
+      Provision a new named, persistent reference bench for a workspace
+      (apps/branches from workspaces.json's "<workspace>" entry), then mark
+      it type: "persistent" in the registry so provision.sh/teardown.sh
+      refuse to touch it. Refuses if MH_MAX_PERSISTENT persistent benches
+      already exist, or if disk space under BENCH_ROOT looks low.
+
+  reference refresh <name> --from-backup <dir>
+      Reseed an existing named reference bench's site from an external
+      `bench backup --with-files` output directory (SKILL.md §3.2.1),
+      recording reference_dataset.source/refreshed_at in the registry.
+
+  reference refresh <name> --from-bench <other-bench-name>
+      Reseed an existing named reference bench from another live bench's
+      current data: runs `bench backup --with-files` on <other-bench-name>
+      and restores that into <name>. Both operations happen under the
+      registry lock so a concurrent provision can't race a torn dataset.
+
 EOF
 }
 
@@ -76,7 +119,69 @@ require_script() {
   fi
 }
 
+require_command() {
+  command -v "$1" >/dev/null 2>&1 || { log "ERROR: required command not found: $1" >&2; exit 1; }
+}
+
 # --- subcommands ---
+
+# Look up workspace "$1" in WORKSPACES_FILE and print it as a resolved
+# provision.sh argv, one argument per line (safe for entries containing
+# spaces, e.g. a --run-after-install shell command). Caller reads this with
+# `mapfile`. Exits non-zero with a message on stderr if the workspace or
+# WORKSPACES_FILE is missing, or the manifest has no primary app.
+resolve_workspace_args() {
+  local workspace="$1"
+  if [ ! -f "$WORKSPACES_FILE" ]; then
+    echo "ERROR: --workspace given but no workspaces file found: $WORKSPACES_FILE" >&2
+    return 1
+  fi
+  if ! jq -e --arg w "$workspace" '.[$w]' "$WORKSPACES_FILE" >/dev/null 2>&1; then
+    echo "ERROR: workspace '$workspace' not found in $WORKSPACES_FILE" >&2
+    echo "Known workspaces: $(jq -r 'keys | join(", ")' "$WORKSPACES_FILE" 2>/dev/null)" >&2
+    return 1
+  fi
+
+  local primary_count
+  primary_count=$(jq -r --arg w "$workspace" '[.[$w].apps[] | select(.role == "primary")] | length' "$WORKSPACES_FILE")
+  if [ "$primary_count" != "1" ]; then
+    echo "ERROR: workspace '$workspace' must declare exactly one app with role \"primary\" (found $primary_count)" >&2
+    return 1
+  fi
+
+  jq -r --arg w "$workspace" '
+    .[$w] as $ws
+    | ($ws.apps[] | select(.role == "primary")) as $primary
+    | (["--app", $primary.name]
+       + (if $primary.branch then ["--branch", $primary.branch] else [] end)
+       + (if $primary.source_repo then ["--source-repo", $primary.source_repo] else [] end)
+       + ([$ws.apps[] | select(.role == "dependency" and .name != "frappe" and (.optional // false | not))
+           | "--extra-app"
+           , (.name + "@" + .branch + (if .source_repo then ("@" + .source_repo) else "" end))
+          ])
+       + ([($ws.post_install_commands // [])[] | "--run-after-install", .])
+      )[]
+  ' "$WORKSPACES_FILE"
+
+  # frappe itself is the framework, not an app fetched via `bench get-app` —
+  # provision.sh sets it via `bench init --frappe-branch`, driven by the
+  # FRAPPE_BRANCH env var (no CLI flag exists for it). A manifest entry named
+  # "frappe" is only ever a documentation-of-intent for which framework
+  # branch this workspace expects; resolve it to FRAPPE_BRANCH here rather
+  # than emitting a bogus --extra-app frappe@... (the filter above already
+  # excludes name == "frappe" from --extra-app for this reason).
+  local frappe_branch
+  frappe_branch=$(jq -r --arg w "$workspace" '[.[$w].apps[] | select(.name == "frappe") | .branch] | first // empty' "$WORKSPACES_FILE")
+  if [ -n "$frappe_branch" ]; then
+    echo "__FRAPPE_BRANCH__=${frappe_branch}"
+  fi
+
+  local ref_bench
+  ref_bench=$(jq -r --arg w "$workspace" '.[$w].reference_bench // empty' "$WORKSPACES_FILE")
+  if [ -n "$ref_bench" ]; then
+    echo "__REFERENCE_BENCH_NAME__=${ref_bench}"
+  fi
+}
 
 cmd_new() {
   require_script "$PROVISION_SCRIPT"
@@ -87,7 +192,49 @@ cmd_new() {
     args+=(--name "$1")
     shift
   fi
-  args+=("$@")
+
+  # Pull out --workspace (provision.sh itself is workspace-agnostic — it
+  # only ever sees the resolved --app/--extra-app/--run-after-install flags;
+  # see SKILL.md §4.4a for why resolution lives here, not in provision.sh).
+  local workspace="" remaining=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --workspace) workspace="$2"; shift 2 ;;
+      *) remaining+=("$1"); shift ;;
+    esac
+  done
+
+  local resolved_ref="" resolved_frappe_branch=""
+  if [ -n "$workspace" ]; then
+    require_command jq
+    local resolved=()
+    local line
+    while IFS= read -r line; do
+      # workspaces.json is plain JSON — jq never expands shell-style
+      # ${VAR} references in string values on its own (e.g.
+      # "${BENCH_ROOT}/.sources/ury.git" in the example manifest). Expand
+      # just ${BENCH_ROOT} here, the one variable a manifest realistically
+      # needs to reference before the bench it's for even exists (so an
+      # absolute literal path can't be written instead).
+      line="${line//\$\{BENCH_ROOT\}/$BENCH_ROOT}"
+      case "$line" in
+        __REFERENCE_BENCH_NAME__=*) resolved_ref="${line#__REFERENCE_BENCH_NAME__=}" ;;
+        __FRAPPE_BRANCH__=*) resolved_frappe_branch="${line#__FRAPPE_BRANCH__=}" ;;
+        *) resolved+=("$line") ;;
+      esac
+    done < <(resolve_workspace_args "$workspace") || exit 1
+    # Manifest-derived flags first, then the caller's own flags appended
+    # after — provision.sh's flag parser is last-wins for single-value
+    # flags, so an explicit --app/--branch the caller passed still overrides
+    # the manifest default; --extra-app/--run-after-install are repeatable
+    # so both sets simply accumulate.
+    args+=("${resolved[@]}" "${remaining[@]}")
+  else
+    args+=("${remaining[@]}")
+  fi
+
+  [ -n "$resolved_ref" ] && export REFERENCE_BENCH_NAME="$resolved_ref"
+  [ -n "$resolved_frappe_branch" ] && export FRAPPE_BRANCH="$resolved_frappe_branch"
   exec "$PROVISION_SCRIPT" "${args[@]}"
 }
 
@@ -253,6 +400,189 @@ cmd_status() {
   fi
 }
 
+cmd_reference() {
+  require_command jq
+  [ $# -eq 0 ] && { log "ERROR: reference subcommand required (list|create|refresh)" >&2; exit 1; }
+  local sub="$1"; shift
+  case "$sub" in
+    list) cmd_reference_list "$@" ;;
+    create) cmd_reference_create "$@" ;;
+    refresh) cmd_reference_refresh "$@" ;;
+    *) log "ERROR: unknown reference subcommand: $sub" >&2; exit 1 ;;
+  esac
+}
+
+cmd_reference_list() {
+  if [ ! -f "$REGISTRY_FILE" ]; then
+    log "No registry file at $REGISTRY_FILE"
+    return 0
+  fi
+  local ws_names=""
+  jq -r '.benches | to_entries[] | select(.value.type == "persistent") |
+    [.key, .value.site_name, (.value.reference_dataset.source // "unseeded"), (.value.reference_dataset.refreshed_at // "never")] | @tsv' \
+    "$REGISTRY_FILE" | while IFS=$'\t' read -r name site dataset_source refreshed_at; do
+      local workspaces=""
+      if [ -f "$WORKSPACES_FILE" ]; then
+        workspaces=$(jq -r --arg n "$name" '[to_entries[] | select(.value.reference_bench == $n) | .key] | join(",")' "$WORKSPACES_FILE" 2>/dev/null)
+      fi
+      printf "  %-20s site=%-24s dataset=%-30s refreshed=%-24s workspaces=%s\n" "$name" "$site" "$dataset_source" "$refreshed_at" "${workspaces:-none}"
+    done
+}
+
+cmd_reference_create() {
+  require_script "$PROVISION_SCRIPT"
+  local name="" workspace="" blank=false dry_run=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --workspace) workspace="$2"; shift 2 ;;
+      --blank) blank=true; shift ;;
+      --dry-run) dry_run=true; shift ;;
+      --help) echo "Usage: mh reference create <name> --workspace <workspace> [--blank] [--dry-run]"; return 0 ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  [ -z "$name" ] && { log "ERROR: reference bench name required" >&2; exit 1; }
+  [ -z "$workspace" ] && { log "ERROR: --workspace required" >&2; exit 1; }
+
+  if [ "$dry_run" = false ]; then
+    if [ -f "$REGISTRY_FILE" ]; then
+      local persistent_count
+      persistent_count=$(jq '[.benches[] | select(.type == "persistent")] | length' "$REGISTRY_FILE")
+      if [ "$persistent_count" -ge "$MH_MAX_PERSISTENT" ]; then
+        log "ERROR: $persistent_count persistent benches already exist (MH_MAX_PERSISTENT=$MH_MAX_PERSISTENT)." >&2
+        log "This is a shared, often memory-constrained host — reference benches should be few and deliberate." >&2
+        log "Raise MH_MAX_PERSISTENT explicitly if you really need another one." >&2
+        exit 1
+      fi
+    fi
+    local avail_kb
+    avail_kb=$(df -Pk "$BENCH_ROOT" 2>/dev/null | awk 'NR==2 {print $4}')
+    if [ -n "$avail_kb" ] && [ "$avail_kb" -lt 20971520 ]; then
+      log "WARNING: less than ~20GB free under $BENCH_ROOT — a new reference bench + backup can be several GB. Proceeding anyway."
+    fi
+  fi
+
+  # A reference bench is created the same way any bench is — via a
+  # workspace-resolved provision.sh call — the only difference is it's then
+  # marked persistent and never gets a track-owned worktree cleaned up by
+  # normal teardown. Use a throwaway track dir under BENCH_ROOT itself so it
+  # isn't tied to any single feature track's lifecycle.
+  local track_dir="${BENCH_ROOT}/.reference-tracks/${name}"
+  mkdir -p "$track_dir"
+
+  local new_args=("$name" --workspace "$workspace" --track-dir "$track_dir")
+  [ "$blank" = true ] && new_args+=(--blank)
+  [ "$dry_run" = true ] && new_args+=(--dry-run)
+
+  # This does NOT restore --from-reference (that would need another
+  # reference bench to already exist for this workspace, which is exactly
+  # what we're creating) — --blank unless a follow-up `mh reference refresh`
+  # seeds it, matching §3.2.1's "reseed after the fact" model.
+  new_args+=(--blank)
+
+  cmd_new "${new_args[@]}"
+
+  if [ "$dry_run" = false ]; then
+    local lock_file="${BENCH_ROOT}/.registry.lock"
+    exec 201>"$lock_file"
+    flock -x 201
+    local tmp; tmp=$(mktemp)
+    jq --arg name "$name" '.benches[$name].type = "persistent"
+      | .benches[$name].purpose = "Named reference bench (mh reference create)"' \
+      "$REGISTRY_FILE" > "$tmp"
+    mv "$tmp" "$REGISTRY_FILE"
+    flock -u 201
+    log "Marked '$name' as a persistent reference bench in the registry."
+    log "It currently holds a blank site — run 'mh reference refresh $name --from-backup <dir>' or '--from-bench <other>' to seed it."
+  fi
+}
+
+cmd_reference_refresh() {
+  local name="" from_backup="" from_bench=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from-backup) from_backup="$2"; shift 2 ;;
+      --from-bench) from_bench="$2"; shift 2 ;;
+      --help) echo "Usage: mh reference refresh <name> (--from-backup <dir> | --from-bench <other-bench-name>)"; return 0 ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+  [ -z "$name" ] && { log "ERROR: reference bench name required" >&2; exit 1; }
+  if [ -z "$from_backup" ] && [ -z "$from_bench" ]; then
+    log "ERROR: --from-backup <dir> or --from-bench <other-bench-name> required" >&2; exit 1
+  fi
+  if [ -n "$from_backup" ] && [ -n "$from_bench" ]; then
+    log "ERROR: give only one of --from-backup / --from-bench" >&2; exit 1
+  fi
+
+  [ -f "$REGISTRY_FILE" ] || { log "ERROR: no registry file at $REGISTRY_FILE" >&2; exit 1; }
+  local bench_type site_name bench_path
+  bench_type=$(jq -r --arg n "$name" '.benches[$n].type // empty' "$REGISTRY_FILE")
+  [ "$bench_type" = "persistent" ] || { log "ERROR: '$name' is not a registered persistent bench — create it first with 'mh reference create'" >&2; exit 1; }
+  site_name=$(jq -r --arg n "$name" '.benches[$n].site_name' "$REGISTRY_FILE")
+  bench_path=$(jq -r --arg n "$name" '.benches[$n].path' "$REGISTRY_FILE")
+
+  # Lock for the whole refresh — a concurrent provision restoring
+  # --from-reference against this same bench mid-refresh would otherwise see
+  # a torn/partial dataset. This is the one operation in this whole family
+  # that mutates a persistent bench's actual data, so it earns the lock even
+  # though nothing else here writes registry.json until the very end.
+  local lock_file="${BENCH_ROOT}/.registry.lock"
+  exec 201>"$lock_file"
+  flock -x 201
+
+  local sql_file="" public_files="" private_files="" dataset_source=""
+
+  if [ -n "$from_bench" ]; then
+    local src_bench_path src_site
+    src_bench_path=$(jq -r --arg n "$from_bench" '.benches[$n].path // empty' "$REGISTRY_FILE")
+    src_site=$(jq -r --arg n "$from_bench" '.benches[$n].site_name // empty' "$REGISTRY_FILE")
+    if [ -z "$src_bench_path" ] || [ -z "$src_site" ]; then
+      flock -u 201
+      log "ERROR: source bench '$from_bench' not found in registry" >&2
+      exit 1
+    fi
+    log "Backing up '$from_bench' ($src_site)..."
+    (cd "$src_bench_path" && bench --site "$src_site" backup --with-files)
+    local backup_dir="${src_bench_path}/sites/${src_site}/private/backups"
+    sql_file=$(find "$backup_dir" -maxdepth 1 -name '*-database.sql.gz' | sort | tail -1)
+    dataset_source="bench:${from_bench}"
+  else
+    sql_file=$(find "$from_backup" -maxdepth 1 -name '*-database.sql.gz' | sort | tail -1)
+    dataset_source="backup:${from_backup}"
+  fi
+
+  if [ -z "$sql_file" ]; then
+    flock -u 201
+    log "ERROR: no *-database.sql.gz found in the backup source" >&2
+    exit 1
+  fi
+  local backup_prefix="${sql_file%-database.sql.gz}"
+  for ext in tgz tar; do
+    [ -f "${backup_prefix}-files.${ext}" ] && public_files="${backup_prefix}-files.${ext}" && break
+  done
+  for ext in tgz tar; do
+    [ -f "${backup_prefix}-private-files.${ext}" ] && private_files="${backup_prefix}-private-files.${ext}" && break
+  done
+
+  log "Restoring into '$name' ($site_name)..."
+  local restore_args=(--force restore "$sql_file")
+  [ -n "$public_files" ] && restore_args+=(--with-public-files "$public_files")
+  [ -n "$private_files" ] && restore_args+=(--with-private-files "$private_files")
+  (cd "$bench_path" && bench --site "$site_name" "${restore_args[@]}")
+  (cd "$bench_path" && bench --site "$site_name" migrate)
+
+  local tmp; tmp=$(mktemp)
+  jq --arg name "$name" --arg src "$dataset_source" \
+    '.benches[$name].reference_dataset = {source: $src, refreshed_at: (now | todate)}' \
+    "$REGISTRY_FILE" > "$tmp"
+  mv "$tmp" "$REGISTRY_FILE"
+  flock -u 201
+
+  log "Reference bench '$name' refreshed from $dataset_source."
+  log "IMPORTANT (SKILL.md §3.2.1/§4.5.3): if the source data has any encrypted fields (passwords, integration secrets), copy its encryption_key into '$name' manually — this command does not do that for you, since the source key must come from wherever the source system stores it, not be guessed."
+}
+
 cmd_doctor() {
   log "Checking environment..."
   local ok=true
@@ -291,6 +621,45 @@ cmd_doctor() {
     ok=false
   fi
 
+  # Workspace-manifest drift check: every workspace's reference_bench must
+  # resolve to a real, currently-persistent registry entry, and every
+  # explicit source_repo that looks like a local path must exist. This is
+  # deliberately validate-only, not sync — workspaces.json is declared
+  # config a human edits; registry.json is live bench state provision.sh
+  # writes. Reconciling them automatically would blur that boundary.
+  if [ -f "$WORKSPACES_FILE" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      echo "  workspaces.json: $WORKSPACES_FILE"
+      local ws
+      for ws in $(jq -r 'keys[]' "$WORKSPACES_FILE"); do
+        local ref_bench
+        ref_bench=$(jq -r --arg w "$ws" '.[$w].reference_bench // empty' "$WORKSPACES_FILE")
+        if [ -n "$ref_bench" ]; then
+          if [ -f "$REGISTRY_FILE" ]; then
+            local ref_type
+            ref_type=$(jq -r --arg n "$ref_bench" '.benches[$n].type // empty' "$REGISTRY_FILE")
+            if [ "$ref_type" != "persistent" ]; then
+              echo "    DRIFT: workspace '$ws' points at reference_bench '$ref_bench', which is not a persistent registry entry (run 'mh reference create $ref_bench --workspace $ws' or fix the manifest)"
+              ok=false
+            fi
+          else
+            echo "    DRIFT: workspace '$ws' points at reference_bench '$ref_bench', but no registry file exists yet at $REGISTRY_FILE"
+            ok=false
+          fi
+        fi
+        local src
+        for src in $(jq -r --arg w "$ws" '.[$w].apps[] | .source_repo // empty | select(startswith("/"))' "$WORKSPACES_FILE"); do
+          if [ ! -e "$src" ]; then
+            echo "    DRIFT: workspace '$ws' references local source_repo path that does not exist: $src"
+            ok=false
+          fi
+        done
+      done
+    else
+      echo "  workspaces.json: present but jq missing, cannot validate"
+    fi
+  fi
+
   if [ "$ok" = true ]; then
     log "All checks passed"
   else
@@ -319,6 +688,7 @@ case "$CMD" in
   audit) cmd_audit "$@" ;;
   status) cmd_status "$@" ;;
   doctor) cmd_doctor "$@" ;;
+  reference) cmd_reference "$@" ;;
   --help|-h|help) usage ;;
   *) log "Unknown command: $CMD" >&2; usage; exit 1 ;;
 esac
