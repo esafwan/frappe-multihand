@@ -12,7 +12,7 @@ set -euo pipefail
 BENCH_ROOT="${BENCH_ROOT:-/opt/benches}"
 REFERENCE_BENCH_NAME="${REFERENCE_BENCH_NAME:-reference}"
 REFERENCE_BENCH_DIR="${REFERENCE_BENCH_DIR:-${BENCH_ROOT}/${REFERENCE_BENCH_NAME}}"
-REFERENCE_SITE="${REFERENCE_SITE:-main.local}"
+REFERENCE_SITE="${REFERENCE_SITE:-${REFERENCE_BENCH_NAME}.local}"
 REGISTRY_FILE="${REGISTRY_FILE:-${BENCH_ROOT}/registry.json}"
 DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD:-change-me}"
 DB_ROOT_USER="${DB_ROOT_USER:-root}"
@@ -32,7 +32,11 @@ FRAPPE_BRANCH="${FRAPPE_BRANCH:-version-15}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-admin}"
 SIGNED_BY="${SIGNED_BY:-${USER:-unknown}}"
 DRY_RUN=false
-FROM_REFERENCE=false
+# Default to restoring from the reference bench's latest backup, not a blank
+# site — the whole point of maintaining a reference bench is that new benches
+# start with real data. Pass --blank to opt out when an empty site is what's
+# actually wanted (e.g. testing a fresh-install / onboarding flow).
+FROM_REFERENCE=true
 # =======================================================
 
 # Parse redis://host:port[/db] and emit "host:port". Defaults to the value of
@@ -91,8 +95,45 @@ Options:
                         BENCH_ROOT/.sources and re-fetched on every run so
                         newly pushed branches are visible.
   --worktree <path>    Worktree output path; must be inside --track-dir
-  --app <app-name>     Frappe app name (default: APP_NAME env var)
-  --from-reference     Restore data from reference bench instead of empty site
+  --app <app-name>     Frappe app name (default: APP_NAME env var). This is
+                        the "primary" app under test: it gets a track-owned
+                        development worktree (§3.1) and is what --branch
+                        applies to. Exactly one per bench.
+  --extra-app <name>@<branch>[@<source>]
+                        A pinned dependency app, repeatable (e.g. erpnext,
+                        hrms). Cloned straight into bench/apps/ via
+                        `bench get-app` — no development worktree, since
+                        these aren't the app under test. <source> is
+                        optional; when omitted, `bench get-app` resolves the
+                        bare app name against the frappe/erpnext GitHub orgs
+                        (fails for apps hosted elsewhere, e.g. `huf` needs an
+                        explicit source URL). Installed before --app, in the
+                        order given, since the primary app commonly depends
+                        on them (e.g. ury needs erpnext+hrms already
+                        installed). `mh new --workspace <name>` expands a
+                        workspace manifest into a series of these flags —
+                        prefer that over hand-writing --extra-app directly.
+  --run-after-install <command>
+                        A shell command to run (via `bash -c`, cwd =
+                        $BENCH_DIR) after all apps are installed, repeatable,
+                        in the order given. For deterministic per-app setup
+                        steps a manifest can declare (e.g. `cd apps/ury &&
+                        yarn install` for a yarn-workspaces monorepo app) —
+                        see workspaces.json's post_install_commands.
+  --from-reference     Restore data from reference bench's latest backup
+                        (this is the DEFAULT — this flag is a no-op kept for
+                        explicitness/back-compat; use --blank to opt out)
+  --blank               Provision an empty site instead of restoring from the
+                        reference bench. Use for testing a fresh-install /
+                        onboarding flow where starting data would be noise.
+  --reference-backup-dir <dir>
+                        Use an explicit backup directory instead of the
+                        reference bench's own sites/<site>/private/backups/.
+                        Must contain a matching set of files named
+                        <ts>-<site>-database.sql.gz, <ts>-<site>-files.tgz,
+                        and <ts>-<site>-private-files.tgz (the standard
+                        `bench backup --with-files` output). Implies
+                        --from-reference (the default).
   --dry-run            Print actions without executing
   --help               Show this help
 
@@ -131,12 +172,35 @@ path_is_inside() {
   esac
 }
 
+# Append $1 (an app name) to $BENCH_DIR/sites/apps.txt, idempotently and
+# newline-safely. `bench init` does not guarantee apps.txt ends in a
+# newline, and neither does `bench get-app` reliably update it for every app
+# — appending without checking corrupts it into a single concatenated line
+# (e.g. "frappehuf"), which breaks every subsequent bench command with
+# ModuleNotFoundError. Call this after any app clone/get-app, not just the
+# primary app — this was previously only done for the primary app, which is
+# exactly the gap that made `bench get-app huf` + `install-app huf` fail with
+# "App huf not in apps.txt" on a real run.
+register_app_in_apps_txt() {
+  local app_name="$1"
+  local apps_txt="${BENCH_DIR}/sites/apps.txt"
+  if [ -s "$apps_txt" ] && [ -n "$(tail -c1 "$apps_txt")" ]; then
+    printf '\n' >> "$apps_txt"
+  fi
+  if ! grep -qxF "$app_name" "$apps_txt" 2>/dev/null; then
+    printf '%s\n' "$app_name" >> "$apps_txt"
+  fi
+}
+
 # Parse args
 NAME=""
 BRANCH=""
 TRACK_DIR="${TRACK_DIR:-}"
 WORKTREE=""
 APP=""
+REFERENCE_BACKUP_DIR=""
+EXTRA_APPS=()
+POST_INSTALL_CMDS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --name) NAME="$2"; shift 2 ;;
@@ -145,7 +209,11 @@ while [ $# -gt 0 ]; do
     --source-repo) SOURCE_REPO="$2"; shift 2 ;;
     --worktree) WORKTREE="$2"; shift 2 ;;
     --app) APP="$2"; shift 2 ;;
+    --extra-app) EXTRA_APPS+=("$2"); shift 2 ;;
+    --run-after-install) POST_INSTALL_CMDS+=("$2"); shift 2 ;;
     --from-reference) FROM_REFERENCE=true; shift ;;
+    --blank) FROM_REFERENCE=false; shift ;;
+    --reference-backup-dir) REFERENCE_BACKUP_DIR="$2"; FROM_REFERENCE=true; shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
     --help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
@@ -161,9 +229,24 @@ APP="${APP:-$APP_NAME}"
 require_command git
 require_command jq
 
+# Guard against clobbering ANY persistent bench, not just the one named by
+# REFERENCE_BENCH_NAME. With multiple named reference benches (one per
+# workspace, see workspaces.json / `mh reference`), a run whose caller forgot
+# to export the matching REFERENCE_BENCH_NAME would otherwise sail right past
+# a name-only check and provision over a different persistent bench. The
+# registry is the actual source of truth for "is this bench persistent" —
+# check it first, and keep the env-var check as a second, cheaper guard for
+# the common case (works even before the registry file exists).
 if [ "$NAME" = "$REFERENCE_BENCH_NAME" ]; then
   echo "ERROR: refusing to provision over reference bench '$REFERENCE_BENCH_NAME'" >&2
   exit 1
+fi
+if [ -f "$REGISTRY_FILE" ]; then
+  existing_type=$(jq -r --arg name "$NAME" '.benches[$name].type // empty' "$REGISTRY_FILE" 2>/dev/null || true)
+  if [ "$existing_type" = "persistent" ]; then
+    echo "ERROR: refusing to provision over persistent bench '$NAME' (registry.json .benches.\"$NAME\".type == \"persistent\")" >&2
+    exit 1
+  fi
 fi
 
 if [ ! -d "$TRACK_DIR" ]; then
@@ -268,7 +351,7 @@ REDIS_CACHE_DB=$N
 REDIS_QUEUE_DB=$N
 REDIS_SOCKETIO_DB=$N
 
-log "Provisioning bench '$NAME' (branch: $BRANCH, app: $APP)"
+log "Provisioning bench '$NAME' (branch: $BRANCH, app: $APP, data: $([ "$FROM_REFERENCE" = true ] && echo "from-reference" || echo "blank"))"
 log "  track: $TRACK_DIR"
 log "  worktree: $WORKTREE"
 log "  source: $SOURCE_REPO"
@@ -301,6 +384,18 @@ if [ "$DRY_RUN" = false ]; then
     [ -n "$existing_watcher_port" ] && WATCH_PORT="$existing_watcher_port"
     log "Resuming existing provisioning intent for '$NAME'"
   else
+    # Build the apps[] array: the primary app (role "primary") plus every
+    # --extra-app entry (role "dependency") — see the workspaces.json model
+    # in SKILL.md §3.2/§4.4a. app_name/bench_app_checkout stay pointed at the
+    # primary for backward compatibility with anything reading those two
+    # fields directly; apps[] is the full picture.
+    EXTRA_APPS_JSON="[]"
+    for entry in "${EXTRA_APPS[@]+"${EXTRA_APPS[@]}"}"; do
+      IFS='@' read -r extra_name extra_branch extra_source <<< "$entry"
+      EXTRA_APPS_JSON=$(jq -c --argjson acc "$EXTRA_APPS_JSON" \
+        --arg n "$extra_name" --arg b "$extra_branch" --arg s "${extra_source:-}" \
+        '$acc + [{name: $n, role: "dependency", branch: $b, source: (if $s == "" then null else $s end)}]' <<< '{}')
+    done
     TMP=$(mktemp)
     jq --arg name "$NAME" \
        --arg path "$BENCH_DIR" \
@@ -310,6 +405,7 @@ if [ "$DRY_RUN" = false ]; then
        --arg track "$TRACK_DIR" \
        --arg source "$SOURCE_REPO" \
        --arg app "$APP" \
+       --argjson extra_apps "$EXTRA_APPS_JSON" \
        --arg signer "$SIGNED_BY" \
        --argjson web "$WEB_PORT" \
        --argjson sock "$SOCK_PORT" \
@@ -325,6 +421,7 @@ if [ "$DRY_RUN" = false ]; then
           worktree: $worktree, track_dir: $track, source_repo: $source,
           worktree_managed: true, app_name: $app,
           bench_app_checkout: ($path + "/apps/" + $app),
+          apps: [{name: $app, role: "primary", branch: $branch, source: $source}] + $extra_apps,
           purpose: "Provisioned by provision.sh",
           ports: {webserver: $web, socketio: $sock, file_watcher: $watch},
           redis: {cache_db: $cache, queue_db: $queue, socketio_db: $socket},
@@ -423,17 +520,7 @@ else
   dry git clone --branch "$BRANCH" --single-branch "$SOURCE_REPO" "$APP_PATH"
 
   if [ "$DRY_RUN" = false ]; then
-    APPS_TXT="$BENCH_DIR/sites/apps.txt"
-    # bench init does not guarantee apps.txt ends in a newline; appending
-    # without checking corrupts it into a single concatenated line (e.g.
-    # "frappehuf"), which breaks every subsequent bench command with
-    # ModuleNotFoundError.
-    if [ -s "$APPS_TXT" ] && [ -n "$(tail -c1 "$APPS_TXT")" ]; then
-      printf '\n' >> "$APPS_TXT"
-    fi
-    if ! grep -qxF "$APP" "$APPS_TXT" 2>/dev/null; then
-      printf '%s\n' "$APP" >> "$APPS_TXT"
-    fi
+    register_app_in_apps_txt "$APP"
   fi
 fi
 
@@ -442,6 +529,34 @@ fi
 # can leave apps/$APP present without ever having pip-installed it, which
 # then silently skips this step forever (ModuleNotFoundError at runtime).
 dry bench pip install -e "$APP_PATH"
+
+# Fetch and register pinned dependency apps (--extra-app), before the
+# primary app is installed on the site below — the primary commonly depends
+# on these (e.g. ury needs erpnext+hrms already present). Each entry is
+# "<name>@<branch>[@<source>]"; get-app handles the org-shorthand vs.
+# explicit-URL resolution and its own clone+pip-install, so this just adds
+# the apps.txt registration get-app doesn't reliably do on its own (the exact
+# gap that broke a real `huf` install: "App huf not in apps.txt" after a
+# successful `bench get-app huf <url>`).
+for entry in "${EXTRA_APPS[@]+"${EXTRA_APPS[@]}"}"; do
+  IFS='@' read -r extra_name extra_branch extra_source <<< "$entry"
+  if [ -z "$extra_name" ] || [ -z "$extra_branch" ]; then
+    echo "ERROR: malformed --extra-app entry (expected name@branch[@source]): $entry" >&2
+    exit 1
+  fi
+  EXTRA_APP_PATH="$BENCH_DIR/apps/$extra_name"
+  if [ -d "$EXTRA_APP_PATH" ]; then
+    log "Extra app '$extra_name' already present; reusing (idempotent)"
+  else
+    log "Fetching extra app: $extra_name@$extra_branch${extra_source:+ from $extra_source}"
+    if [ "$DRY_RUN" = true ]; then
+      log "would run: bench get-app $extra_name --branch $extra_branch ${extra_source:-}"
+    else
+      dry bench get-app "$extra_name" --branch "$extra_branch" ${extra_source:+"$extra_source"}
+    fi
+  fi
+  [ "$DRY_RUN" = false ] && register_app_in_apps_txt "$extra_name"
+done
 
 # Configure
 dry bench set-config -g db_host "$MARIADB_HOST"
@@ -498,12 +613,87 @@ else
 fi
 
 if [ "$FROM_REFERENCE" = true ]; then
-  log "Restore from reference requested; follow SKILL.md §4.5 for backup selection."
+  # Locate a matching set of `bench backup --with-files` output files, either
+  # from an explicit --reference-backup-dir or the reference bench's own
+  # sites/<site>/private/backups/ (most recent by filename timestamp prefix).
+  BACKUP_SEARCH_DIR="${REFERENCE_BACKUP_DIR:-${REFERENCE_BENCH_DIR}/sites/${REFERENCE_SITE}/private/backups}"
+  if [ ! -d "$BACKUP_SEARCH_DIR" ]; then
+    echo "ERROR: --from-reference requested but backup directory does not exist: ${BACKUP_SEARCH_DIR}" >&2
+    exit 1
+  fi
+
+  SQL_FILE=$(find "$BACKUP_SEARCH_DIR" -maxdepth 1 -name '*-database.sql.gz' | sort | tail -1)
+  if [ -z "$SQL_FILE" ]; then
+    echo "ERROR: no *-database.sql.gz backup found in ${BACKUP_SEARCH_DIR}" >&2
+    exit 1
+  fi
+  # Public/private files backups share the SQL file's timestamp+site prefix
+  # (strip the known suffix rather than globbing independently, so a stale
+  # unrelated archive in the same directory can't get paired with the wrong
+  # SQL). Frappe emits these as .tgz (compress_backup) or plain .tar
+  # (uncompressed) depending on site config — a manually-provided backup dir
+  # (e.g. Telegram/Slack-shared) and a bench's own `bench backup --with-files`
+  # output have been observed to differ here, so check both extensions.
+  BACKUP_PREFIX="${SQL_FILE%-database.sql.gz}"
+  PUBLIC_FILES=""
+  for ext in tgz tar; do
+    [ -f "${BACKUP_PREFIX}-files.${ext}" ] && PUBLIC_FILES="${BACKUP_PREFIX}-files.${ext}" && break
+  done
+  PRIVATE_FILES=""
+  for ext in tgz tar; do
+    [ -f "${BACKUP_PREFIX}-private-files.${ext}" ] && PRIVATE_FILES="${BACKUP_PREFIX}-private-files.${ext}" && break
+  done
+
+  RESTORE_ARGS=(--force restore "$SQL_FILE" --mariadb-root-username "$DB_ROOT_USER" --mariadb-root-password "$DB_ROOT_PASSWORD")
+  [ -n "$PUBLIC_FILES" ] && RESTORE_ARGS+=(--with-public-files "$PUBLIC_FILES") || log "WARN: no matching public files backup (${BACKUP_PREFIX}-files.{tgz,tar}); restoring database only"
+  [ -n "$PRIVATE_FILES" ] && RESTORE_ARGS+=(--with-private-files "$PRIVATE_FILES") || log "WARN: no matching private files backup (${BACKUP_PREFIX}-private-files.{tgz,tar}); restoring database only"
+
+  log "Restoring from reference backup: ${SQL_FILE}"
+  dry bench --site "$SITE_NAME" "${RESTORE_ARGS[@]}"
+
+  # §4.5.3: copy the reference bench's encryption_key so encrypted fields in
+  # the restored data (passwords, integration secrets) stay decryptable.
+  # Never pass --encryption-key on the same restore command as
+  # --with-public-files/--with-private-files (bench rejects that combination);
+  # setting it after restore is the only supported order.
+  REF_SITE_CONFIG="${REFERENCE_BENCH_DIR}/sites/${REFERENCE_SITE}/site_config.json"
+  if [ "$DRY_RUN" = false ] && [ -f "$REF_SITE_CONFIG" ]; then
+    REF_KEY=$(jq -r '.encryption_key // empty' "$REF_SITE_CONFIG")
+    if [ -n "$REF_KEY" ]; then
+      dry bench --site "$SITE_NAME" set-config encryption_key "$REF_KEY"
+    else
+      log "WARN: reference site_config.json has no encryption_key; restored site keeps its own freshly-generated key, so any encrypted values from the backup will fail to decrypt"
+    fi
+  fi
+
+  # Reconcile schema differences between the backup's source app versions and
+  # this bench's cloned app versions.
+  dry bench --site "$SITE_NAME" migrate
 fi
 
-# Install app from the bench's branch checkout, never from the development
-# worktree and never with a shared source path.
+# Install dependency apps first (primary commonly depends on them), then the
+# primary app from the bench's branch checkout — never from the development
+# worktree, never with a shared source path. Both idempotent — a no-op for
+# any app the restore above already installed.
+for entry in "${EXTRA_APPS[@]+"${EXTRA_APPS[@]}"}"; do
+  IFS='@' read -r extra_name _ _ <<< "$entry"
+  dry bench --site "$SITE_NAME" install-app "$extra_name"
+done
 dry bench --site "$SITE_NAME" install-app "$APP"
+
+# Run any declared post-install setup commands (e.g. `cd apps/ury && yarn
+# install` for a yarn-workspaces monorepo app) — deterministic per-app setup
+# steps a workspace manifest can automate, as opposed to free-text notes an
+# agent has to remember by hand. Runs with cwd = $BENCH_DIR; each command is
+# logged before running so a failure is traceable to which one broke.
+for cmd in "${POST_INSTALL_CMDS[@]+"${POST_INSTALL_CMDS[@]}"}"; do
+  log "Running post-install command: $cmd"
+  if [ "$DRY_RUN" = true ]; then
+    log "would run: $cmd"
+  else
+    (cd "$BENCH_DIR" && bash -c "$cmd")
+  fi
+done
 
 log "Health check: run 'bench start' and curl http://127.0.0.1:${WEB_PORT}/api/method/ping"
 
