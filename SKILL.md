@@ -225,6 +225,185 @@ Maintain one **reference bench** that is always stable and never mutated. It is 
 
 Name it unmistakably (e.g. `reference`, `main`, `stable`). Every teardown and provisioning script must refuse to operate on the reference bench.
 
+"Never mutated" governs `provision.sh`/`teardown.sh` — automated scripts must
+refuse to touch it. It does not forbid a human or agent from deliberately
+**reseeding** the reference bench's own dataset as a maintenance operation
+(§3.2.1); that is a distinct, occasional, manually-triggered action, not
+something disposable-bench lifecycle scripts do.
+
+#### 3.2.1 Reseeding the reference bench from an external backup
+
+The reference bench does not have to start (or stay) as a blank site. It is
+often more useful to seed it once from a realistic external snapshot — e.g. a
+partner's UAT/staging backup — so that every disposable bench created with
+`--from-reference` (§4.5) inherits realistic data instead of an empty
+database. This is a distinct operation from §4.5 (which restores a
+*disposable* bench from the *reference* bench's own backup); here you are
+replacing the reference bench's own data with an externally supplied backup.
+
+1. Stage the three backup artifacts somewhere visible to the bench container
+   — e.g. `${TRACKS_DIR}/reference-backup-source/` — not just on the host
+   Downloads folder, which the container cannot see:
+   - `<timestamp>-<site>-database.sql.gz`
+   - `<timestamp>-<site>-files.tgz` (public files)
+   - `<timestamp>-<site>-private-files.tgz` (private files)
+2. Recreate the reference site and restore into it:
+   ```bash
+   bench new-site "${REFERENCE_SITE}" --force \
+     --mariadb-root-username "${DB_ROOT_USER}" \
+     --mariadb-root-password "${DB_ROOT_PASSWORD}" \
+     --admin-password "${ADMIN_PASSWORD}" \
+     --db-name "${DB_NAME}" --db-password "${DB_PASSWORD}"
+
+   bench --site "${REFERENCE_SITE}" --force restore "${BACKUP_SQL_FILE}" \
+     --with-public-files "${PUBLIC_FILES_TAR}" \
+     --with-private-files "${PRIVATE_FILES_TAR}" \
+     --mariadb-root-username "${DB_ROOT_USER}" \
+     --mariadb-root-password "${DB_ROOT_PASSWORD}"
+
+   bench --site "${REFERENCE_SITE}" migrate
+   ```
+3. **Encryption key — do not skip.** The same gotcha as §4.5.3 applies here,
+   and is easier to miss because there is no disposable-bench checklist
+   forcing it: any `Password`-type or otherwise encrypted field in the
+   restored data was encrypted with the **source system's** `encryption_key`,
+   not one `bench new-site` generates locally. That source key must be
+   fetched from the source system's own `site_config.json` (or wherever it
+   is stored) and copied in — the same way §4.5.3 copies it from a reference
+   bench, except here the reference bench *is* the destination. If a backup
+   export does not carry a `site_config_backup.json` with the key already in
+   it, get the key separately before trusting any encrypted field in the
+   restored site; **never fabricate a key** — a wrong key does not error
+   loudly, it just returns garbage on decrypt.
+   ```bash
+   bench --site "${REFERENCE_SITE}" set-config encryption_key "${SOURCE_ENCRYPTION_KEY}"
+   ```
+   Verify after restore: `jq 'has("encryption_key")' sites/${REFERENCE_SITE}/site_config.json`.
+4. Update `BENCH_IDENTITY.md` (§4.8) and the registry with what dataset the
+   reference bench now holds and when it was refreshed, so agents creating
+   disposable benches from it (§4.5) know what data to expect and how stale
+   it is. `mh reference refresh` (§3.2.2) automates this — it writes
+   `reference_dataset: {source, refreshed_at}` on the registry entry for you.
+
+### 3.2.2 Multiple named reference benches & workspace manifests
+
+§3.2's model — one reference bench, one app — breaks down the moment two
+different products/app-mixes share a host. A `ury` (Frappe/ERPNext POS)
+bench needs `frappe`+`erpnext`+`hrms`+`ury`(+optionally `huf`); a `huf`
+(AI-agent app) bench needs only `frappe`+`huf` — entirely different app
+sets, entirely different realistic datasets. Forcing both through one
+`REFERENCE_BENCH_NAME` means either one workspace's benches restore from the
+wrong dataset, or every provisioning call has to remember to export the
+right override by hand.
+
+**`workspaces.json`** (default location `${BENCH_ROOT}/workspaces.json`,
+override via `WORKSPACES_FILE`) is a separate, hand-edited, **read-mostly**
+config file — deliberately not folded into `registry.json`. `registry.json`
+is mutable bench *state*, written under `${BENCH_ROOT}/.registry.lock` by
+provision/teardown/audit; `workspaces.json` is declared *config* a human
+edits and should keep under version control alongside the rest of a
+project's ops docs. **Nothing in the provisioning path writes to
+`workspaces.json`** — only a human, or `mh reference create/refresh` writing
+back to `registry.json` (never to the manifest itself).
+
+Shape:
+
+```json
+{
+  "ury": {
+    "reference_bench": "reference",
+    "apps": [
+      {"name": "frappe", "role": "dependency", "branch": "version-15"},
+      {"name": "erpnext", "role": "dependency", "branch": "version-15"},
+      {"name": "hrms", "role": "dependency", "branch": "version-15"},
+      {"name": "ury", "role": "primary", "branch": "develop",
+       "source_repo": "${BENCH_ROOT}/.sources/ury.git"},
+      {"name": "huf", "role": "dependency", "branch": "pre-develop",
+       "source_repo": "https://github.com/tridz-dev/huf.git", "optional": true,
+       "post_install_notes": "sites/apps.txt may not auto-update on get-app. HUF's own sync_app_tools(app_name=None) silently no-ops -- after install-app, call sync_app_tools(app_name='ury') explicitly if you need tool registration to actually run (upstream HUF bug, not this skill's to fix)."}
+    ],
+    "post_install_commands": ["cd apps/ury && yarn install"]
+  },
+  "huf": {
+    "reference_bench": "reference-huf",
+    "apps": [
+      {"name": "frappe", "role": "dependency", "branch": "version-15"},
+      {"name": "huf", "role": "primary", "branch": "pre-develop",
+       "source_repo": "https://github.com/tridz-dev/huf.git"}
+    ]
+  }
+}
+```
+
+Field notes:
+- Exactly one `role: "primary"` app per workspace — the app under test, which gets the
+  track-owned development worktree (§3.1) and is what `--branch` overrides. Every other app is
+  `role: "dependency"`: pinned, cloned straight into `bench/apps/` via `bench get-app`, no worktree.
+- A `"frappe"` entry is documentation-of-intent for which framework branch this workspace expects
+  — it resolves to `bench init --frappe-branch`, not a `bench get-app frappe` call (frappe isn't
+  fetched the way other apps are). `mh` strips it out of the `--extra-app` list it builds and sets
+  `FRAPPE_BRANCH` from it instead.
+- `optional: true` on a dependency app means `mh new --workspace <name>` does **not** fetch it by
+  default (e.g. most `ury` tracks don't need `huf`) — pass `--extra-app huf@pre-develop@<url>`
+  by hand on top of `mh new --workspace ury ...` for the tracks that do.
+- `post_install_notes` (free text, surfaced to whoever reads the manifest, never executed) vs.
+  `post_install_commands` (real, automated shell steps run via `provision.sh --run-after-install`,
+  cwd = the bench root) — keep genuinely deterministic setup (`yarn install`, an `apps.txt` fixup)
+  in the latter; keep "this upstream app has a quirk, remember X" notes in the former. Don't
+  automate something whose correct fix lives in another project's code (see the HUF example above).
+- `reference_bench` may point at the same bench for multiple workspaces, or be workspace-specific.
+  It falls back to nothing implicit — if omitted, `mh new --workspace <name>` still resolves the
+  app list but leaves `REFERENCE_BENCH_NAME` at whatever the environment already has (normally the
+  single global default, `"reference"`).
+
+**Resolution lives in `mh`, not `provision.sh`.** `provision.sh` stays workspace-agnostic: it only
+ever sees `--app` (repeatable-in-spirit but exactly one primary), `--extra-app
+<name>@<branch>[@<source>]` (repeatable), and `--run-after-install <command>` (repeatable) — plus
+whatever `REFERENCE_BENCH_NAME`/`FRAPPE_BRANCH` env vars are already set. This keeps the existing
+single-app flow (any caller already using `--app`/`--branch`/`APP_NAME` directly) completely
+unaffected — nothing about `--workspace` changes `provision.sh`'s own behavior when it's absent.
+`mh new <name> --workspace <workspace> --branch <branch> --track-dir <dir>` expands the manifest
+into those flags and `exec`s `provision.sh`; run it with `--dry-run` to see exactly what a
+workspace resolves to before provisioning anything for real — this is the single most useful command
+for answering "what apps/branches does the X workspace actually need" without re-deriving it from
+freeform track notes.
+
+**`mh reference` command family** formalizes what §3.2.1 otherwise requires typing out by hand
+every time:
+
+- `mh reference list` — every `type: "persistent"` registry entry, its `reference_dataset`
+  provenance, and which workspaces point at it.
+- `mh reference create <name> --workspace <workspace> [--blank]` — provisions a new bench via the
+  same workspace-resolution path as `mh new`, then marks it `type: "persistent"` in the registry.
+  Refuses if `MH_MAX_PERSISTENT` (default 4) persistent benches already exist, or disk under
+  `BENCH_ROOT` looks low (~20GB) — a cheap guard against reference-bench sprawl on a shared,
+  memory-constrained host; raise the env var explicitly if a host genuinely has room for more.
+  Always starts blank (data comes from a follow-up refresh, per §3.2.1's "reseed after the fact"
+  model) — restoring `--from-reference` here would need another reference bench for the same
+  workspace to already exist, which is exactly what's being created.
+- `mh reference refresh <name> --from-backup <dir>` — §3.2.1's manual reseed procedure, as a real
+  command. Runs under `${BENCH_ROOT}/.registry.lock` for its whole duration (a concurrent
+  `--from-reference` provision reading this bench's backups mid-refresh would otherwise see a torn
+  dataset), and records `reference_dataset: {source, refreshed_at}` on success.
+- `mh reference refresh <name> --from-bench <other-bench-name>` — the "I want this reference bench
+  to have the same rich data as some other live bench" operation: backs up `<other-bench-name>` and
+  restores that into `<name>`, same locking/recording as above.
+- **Neither `refresh` command copies the encryption key for you** (§4.5.3's gotcha applies
+  identically here) — it prints a reminder on success; verify and copy it manually if the source
+  data has any encrypted fields.
+
+**Migrating an existing single-reference setup**: don't rename the existing `reference` bench —
+that means moving a directory, rewriting `common_site_config.json`, and `REFERENCE_SITE`
+(`reference.local`) for zero functional benefit. Just add `workspaces.json` with
+`"<workspace>": {"reference_bench": "reference", ...}` pointing the existing bench's name, and
+everything that already restores `--from-reference` today keeps working unchanged.
+
+**Drift, not sync**: `mh doctor` validates that every workspace's `reference_bench` resolves to a
+real `type: "persistent"` registry entry, and that every local-path `source_repo` in the manifest
+actually exists — it reports drift, it does not silently fix it. `workspaces.json` and
+`registry.json` are allowed to disagree (e.g. mid-way through creating a new reference bench); the
+validation exists so that disagreement is visible, not automatically papered over.
+
 ### 3.3 Shared services
 
 MariaDB and Redis run as sibling containers, **not** inside the bench container:
@@ -485,8 +664,14 @@ bench new-site "${SITE_NAME}" \
   --db-name "${DB_NAME}" \
   --db-password "${DB_PASSWORD}"
 
-# 7. Install app(s).
+# 7. Install app(s). A bench almost always needs more than one app — e.g. a
+#    Frappe/ERPNext app needs erpnext+hrms already installed first. Install
+#    every pinned dependency app before the primary one under test:
+bench --site "${SITE_NAME}" install-app "${DEPENDENCY_APP_NAME}"  # repeat per dependency, in order
 bench --site "${SITE_NAME}" install-app "${APP_NAME}"
+# `examples/provision.sh` does this via repeated --extra-app flags (§4.4a),
+# resolved automatically from a workspace manifest by `mh new --workspace`
+# (§3.2.2) — prefer that over hand-listing every app/branch per bench.
 
 # 7a. Build frontend assets AND sync the sites/assets symlink. `yarn build`
 #     (or `npm run build`) inside an app's frontend/ only writes the bundle
@@ -504,7 +689,11 @@ bench build --app "${APP_NAME}"
 
 ### 4.5 Restore-from-reference mode
 
-Use this when you need realistic data from the reference bench.
+Use this when you need realistic data from the reference bench. If the
+reference bench itself was reseeded from an external backup per §3.2.1
+(rather than being a fresh empty site), disposable benches built this way
+inherit that external dataset — check `BENCH_IDENTITY.md` on the reference
+bench to see what it currently holds.
 
 #### 4.5.1 Create the backup in the reference bench first
 
@@ -703,7 +892,16 @@ Keep a single source of truth, for example `${BENCH_ROOT}/registry.json`. Each e
 - `redis` (cache_db, queue_db, socketio_db)
 - `database` (db_name, db_user)
 - `branch`, `worktree`, `purpose`
-- `track_dir`, `source_repo`, `worktree_managed`, `app_name`, `bench_app_checkout`
+- `track_dir`, `source_repo`, `worktree_managed`, `app_name`, `bench_app_checkout` — these two
+  (`app_name`/`bench_app_checkout`) always describe the **primary** app for backward compatibility;
+  see `apps` below for the full picture on a multi-app bench.
+- `apps` (array, §4.4a) — every app installed on this bench: `[{name, role: "primary" |
+  "dependency", branch, source}]`. Exactly one `role: "primary"` entry (the app under test, which
+  owns the development worktree); any number of `role: "dependency"` entries (pinned, no worktree).
+  Written by `provision.sh` from `--app` (primary) + repeated `--extra-app` (dependencies).
+- `reference_dataset` (object, only on `type: "persistent"` entries, §3.2.2) — `{source,
+  refreshed_at}`, written by `mh reference refresh`. Absent or `unseeded`-reporting means the
+  reference bench still holds whatever `bench new-site`/`--blank` gave it, not a real dataset.
 - `created_at`, `created_by`, `signed_by`, `task_description`
 - `pid` or `process_group` of `bench start` if running
 
@@ -911,6 +1109,72 @@ If a DB index has keys but no registry entry uses that index, it is orphaned.
    bench must contain a normal checkout of the selected branch.
 7. **Remove managed development worktrees with Git, not `rm -rf`.**
 
+### 8.1a Syncing new commits into an already-provisioned bench
+
+The bench's `apps/<app>` checkout (see §3.1) is a **separate, independent git
+checkout** from the development worktree — by design, for isolation. When you
+make further commits in the development worktree *after* the bench was already
+provisioned and is still running, do **not** copy files into the bench checkout
+with `docker cp`, `rsync`, or any other out-of-band mechanism — not even "just
+this once" or "only these N files." That desyncs the bench checkout from its
+own git history: `git status` there will show mystery uncommitted diffs with no
+record of why, and it silently breaks the *next* `git pull`/`git merge` on that
+checkout (a dirty working tree blocks or conflicts against real incoming
+changes later).
+
+Always sync through git:
+
+```bash
+# From inside the bench's app checkout (not the dev worktree):
+git fetch <remote-the-dev-worktree-pushed-to> <branch>
+git merge --ff-only FETCH_HEAD   # fails loudly if it isn't actually a fast-forward
+```
+
+If pushing from the dev worktree to the bench's own `source_repo` remote fails
+with `refusing to update checked out branch` (the standard non-bare-repo
+protection), that error is correct behavior, not an obstacle to route around.
+It means `source_repo` has this exact branch checked out somewhere (usually the
+bench checkout itself). Do not `docker cp` around it. Instead, either:
+
+- fetch directly from the branch's real upstream (e.g. GitHub) into the bench
+  checkout instead of through the local `source_repo` mirror — this is usually
+  the fastest fix and needs no config changes, or
+- set `receive.denyCurrentBranch = updateInstead` on that specific
+  `source_repo` if it's dedicated to this one bench/track and nothing else
+  depends on its working tree staying put.
+
+After any git-based sync, confirm `git status` is clean and `git log --oneline
+-3` shows the exact commits you expect, before rebuilding or restarting the
+bench.
+
+### 8.1b Restarting a bench started via `nohup bench start`
+
+Disposable benches provisioned by this skill are typically started in the
+foreground via `nohup bench start > logs/bench-start.log 2>&1 &` (honcho),
+**not** under supervisor. On that setup, `bench restart` is unreliable — it can
+spawn a *second* `frappe serve --port <N>` process alongside the still-running
+original instead of replacing it, leaving two processes bound near the same
+port. Backend code changes then appear not to take effect (you may be hitting
+whichever process actually owns the port, unpredictably), and a plain code
+diff review will not catch it.
+
+To restart such a bench, don't rely on `bench restart`. Kill everything for
+that bench explicitly, then start fresh:
+
+```bash
+pkill -f 'benches/<bench-name>.*frappe serve'
+pkill -f 'benches/<bench-name>.*frappe watch'
+pkill -f 'benches/<bench-name>.*frappe worker'
+pkill -f 'benches/<bench-name>.*frappe schedule'
+# confirm nothing left:
+ps aux | grep <bench-name> | grep -v grep
+# then start clean:
+nohup bench start > logs/bench-start.log 2>&1 &
+```
+
+Verify with `ps aux | grep <bench-name>` that exactly one `frappe serve`
+process exists before trusting a live re-test of a backend change.
+
 ### 8.2 Shared-queue risk
 
 Using the same Redis instance with DB indexes for `redis_queue` does **not** fully isolate job queues. RQ workers from one bench can in principle consume jobs from another bench's queue DB if misconfigured. Worse, schedulers across benches may interact. This is a data-corruption risk.
@@ -1044,6 +1308,8 @@ Configuration points you must set before using the templates:
 | `TRACK_DIR` | `/path/to/Tracks/owner.Feature` | Owning track directory; all development worktrees must live below it |
 | `SIGNED_BY` | `claude` | Agent or human identity creating the bench (`claude`, `agy`, `codex`, `kimi`, `human`, etc.) |
 | `TASK_DESCRIPTION` | `"Test auth refactor before PR merge"` | Short description of why this bench was created |
+| `WORKSPACES_FILE` | `${BENCH_ROOT}/workspaces.json` | Declared, read-mostly app/branch/reference-bench manifest per workspace (§3.2.2). `mh new --workspace <name>` reads it; nothing in the provisioning path writes to it |
+| `MH_MAX_PERSISTENT` | `4` | Cap on `type: "persistent"` registry entries `mh reference create` will allow before refusing — a guard against reference-bench sprawl on a shared host (§3.2.2) |
 
 `audit.sh` reconciles registry vs reality and, for any orphaned or missing entries discovered, writes them to the workspace archive (`${BENCH_ROOT}/archive.json`) with `outcome: "orphaned"` before flagging them in the report.
 
@@ -1058,7 +1324,11 @@ The `examples/mh` script is a thin wrapper that provides quick commands for huma
 | Command | What it does |
 |---------|--------------|
 | `mh new <name> --branch <branch> --track-dir <dir> [--source-repo <repo>] [--app <app>] [--from-reference] [--dry-run]` | Create a development worktree and a separate branch checkout in a disposable bench (wraps `provision.sh`). |
+| `mh new <name> --workspace <workspace> --branch <branch> --track-dir <dir> [--dry-run]` | Same, but the app list, dependency branches, and reference bench are resolved from `workspaces.json` (§3.2.2) instead of being typed by hand. |
 | `mh list [--json]` | List registered benches (wraps `list.sh`). |
+| `mh reference list` | List every persistent (named reference) bench and what dataset it holds (§3.2.2). |
+| `mh reference create <name> --workspace <workspace> [--blank] [--dry-run]` | Provision a new named, persistent reference bench for a workspace. |
+| `mh reference refresh <name> --from-backup <dir>` \| `--from-bench <other>` | Reseed an existing named reference bench from an external backup or another live bench's current data (§3.2.1/§3.2.2). |
 | `mh testplan <name> [--output <file>]` | Generate a test plan template for a bench. |
 | `mh open <name>` | Open the bench site in the default browser. |
 | `mh logs <name>` | Tail the bench logs. |

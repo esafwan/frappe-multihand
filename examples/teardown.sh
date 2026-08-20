@@ -52,6 +52,17 @@ if [ "$NAME" = "$REFERENCE_BENCH_NAME" ]; then
   echo "ERROR: refusing to teardown the reference bench '$REFERENCE_BENCH_NAME'" >&2
   exit 1
 fi
+# Same registry-based guard as provision.sh: with multiple named reference
+# benches, the env-var-only check above only catches the one whose name
+# happens to match REFERENCE_BENCH_NAME for this invocation. Check the
+# registry's own type field for every bench, not just that one name.
+if [ -f "$REGISTRY_FILE" ]; then
+  existing_type=$(jq -r --arg name "$NAME" '.benches[$name].type // empty' "$REGISTRY_FILE" 2>/dev/null || true)
+  if [ "$existing_type" = "persistent" ]; then
+    echo "ERROR: refusing to teardown persistent bench '$NAME' (registry.json .benches.\"$NAME\".type == \"persistent\")" >&2
+    exit 1
+  fi
+fi
 
 BENCH_DIR="${BENCH_ROOT}/${NAME}"
 LOCK_FILE="${BENCH_ROOT}/.registry.lock"

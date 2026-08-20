@@ -1,0 +1,42 @@
+{
+  "_comment": "Example workspaces.json — see SKILL.md §3.2.2. Declared, read-mostly config: nothing in provision.sh/teardown.sh/audit.sh writes here. Copy to ${BENCH_ROOT}/workspaces.json and adapt.",
+
+  "ury": {
+    "reference_bench": "reference",
+    "apps": [
+      {"name": "frappe", "role": "dependency", "branch": "version-15"},
+      {"name": "erpnext", "role": "dependency", "branch": "version-15"},
+      {"name": "hrms", "role": "dependency", "branch": "version-15"},
+      {
+        "name": "ury",
+        "role": "primary",
+        "branch": "develop",
+        "source_repo": "${BENCH_ROOT}/.sources/ury.git"
+      },
+      {
+        "name": "huf",
+        "role": "dependency",
+        "branch": "pre-develop",
+        "source_repo": "https://github.com/tridz-dev/huf.git",
+        "optional": true,
+        "post_install_notes": "sites/apps.txt may not auto-update on get-app. HUF's own sync_app_tools(app_name=None) silently no-ops -- after install-app, call sync_app_tools(app_name='ury') explicitly if you need tool registration to actually run (upstream HUF bug, not this skill's to fix)."
+      }
+    ],
+    "post_install_commands": [
+      "cd apps/ury && yarn install"
+    ]
+  },
+
+  "huf": {
+    "reference_bench": "reference-huf",
+    "apps": [
+      {"name": "frappe", "role": "dependency", "branch": "version-15"},
+      {
+        "name": "huf",
+        "role": "primary",
+        "branch": "pre-develop",
+        "source_repo": "https://github.com/tridz-dev/huf.git"
+      }
+    ]
+  }
+}
