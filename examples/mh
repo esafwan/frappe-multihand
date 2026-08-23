@@ -11,7 +11,7 @@
 #   new <name> --branch <branch> --track-dir <dir> [--source-repo <repo>] [--app <app>] [--blank] [--dry-run]  # restores from reference by default
 #   list [--json]
 #   testplan <name> [--output <file>]
-#   open <name>
+#   open <name> [--auth|--plain]  # opens an Administrator-authenticated URL by default
 #   logs <name>
 #   teardown <name> [--dry-run]
 #   audit [--fix] [--json]
@@ -38,6 +38,11 @@ WORKSPACES_FILE="${WORKSPACES_FILE:-${BENCH_ROOT}/workspaces.json}"
 # reference-bench sprawl on a shared, memory-constrained host. Override for
 # a host that's known to have room for more.
 MH_MAX_PERSISTENT="${MH_MAX_PERSISTENT:-4}"
+# Persisted default for `mh open`'s URL mode ("auth" or "plain"). One file
+# per machine/BENCH_ROOT, not per bench — `mh open --auth`/`--plain` (with no
+# bench-specific scope) overwrites it so the choice sticks for every future
+# `mh open` call, not just the current one.
+OPEN_MODE_FILE="${OPEN_MODE_FILE:-${BENCH_ROOT}/.mh_open_mode}"
 # =======================================================
 
 usage() {
@@ -65,8 +70,16 @@ Commands:
   testplan <name> [--output <file>]
       Generate a test plan template for a bench.
 
-  open <name>
-      Open the bench site in the default browser.
+  open <name> [--auth|--plain]
+      Open the bench site in the default browser. Defaults to an
+      Administrator-authenticated URL (mints a fresh sid via `bench console`
+      login_as, no password involved — see SKILL.md's headless-session
+      note). Pass --auth or --plain to force a mode for this call AND
+      persist it as the machine-wide default for future `mh open` calls
+      (stored in OPEN_MODE_FILE, normally ${BENCH_ROOT}/.mh_open_mode). With
+      no flag, reuses whatever was last persisted (or "auth" the very first
+      time). Falls back to a plain URL with a warning if the registry has no
+      site_name/path for <name>, or if minting a session fails.
 
   logs <name>
       Tail the bench logs.
@@ -322,23 +335,84 @@ EOF
   fi
 }
 
+# Mint a fresh Administrator sid for "$2" (site name) in bench "$1" (bench
+# path) via `bench console`, no password involved — the same login_as trick
+# documented in SKILL.md's headless-session-auth reference. Prints the sid
+# on stdout, or nothing on failure (caller checks for empty).
+mint_admin_sid() {
+  local bench_path="$1" site_name="$2"
+  local pyscript
+  pyscript=$(cat <<PYEOF
+import frappe
+from frappe.auth import LoginManager, CookieManager, HTTPRequest
+from werkzeug.test import EnvironBuilder
+from werkzeug.wrappers import Request
+
+builder = EnvironBuilder(method="GET", path="/", headers={"Host": "${site_name}"})
+request = Request(builder.get_environ())
+frappe.local.request = request
+frappe.local.form_dict = frappe._dict()
+frappe.local.cookie_manager = CookieManager()
+frappe.local.http_request = HTTPRequest()
+frappe.local.login_manager = LoginManager()
+frappe.local.login_manager.login_as("Administrator")
+frappe.db.commit()
+print("MH_SID_OUTPUT=" + frappe.session.sid)
+PYEOF
+)
+  (cd "$bench_path" && bench --site "$site_name" console) <<<"$pyscript" 2>/dev/null \
+    | grep -o 'MH_SID_OUTPUT=.*' | tail -1 | cut -d= -f2-
+}
+
 cmd_open() {
-  local name=""
+  local name="" mode_override=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --help) echo "Usage: mh open <name>"; exit 0 ;;
+      --auth) mode_override="auth"; shift ;;
+      --plain) mode_override="plain"; shift ;;
+      --help) echo "Usage: mh open <name> [--auth|--plain]"; exit 0 ;;
       *) name="$1"; shift ;;
     esac
   done
   [ -z "$name" ] && { log "ERROR: bench name required" >&2; exit 1; }
 
-  # Read port from registry if available
-  local port="8080"
+  local mode
+  if [ -n "$mode_override" ]; then
+    mode="$mode_override"
+    echo "$mode" > "$OPEN_MODE_FILE"
+    log "Default open mode set to '$mode' (persisted at $OPEN_MODE_FILE)"
+  elif [ -f "$OPEN_MODE_FILE" ]; then
+    mode="$(cat "$OPEN_MODE_FILE")"
+  else
+    mode="auth"
+    echo "$mode" > "$OPEN_MODE_FILE"
+  fi
+
+  # Read port/site/path from registry if available
+  local port="8080" site_name="" bench_path=""
   if [ -f "${BENCH_ROOT}/registry.json" ] && command -v jq >/dev/null 2>&1; then
     port=$(jq -r --arg name "$name" '.benches[$name].ports.webserver // 8080' "${BENCH_ROOT}/registry.json")
+    site_name=$(jq -r --arg name "$name" '.benches[$name].site_name // empty' "${BENCH_ROOT}/registry.json")
+    bench_path=$(jq -r --arg name "$name" '.benches[$name].path // empty' "${BENCH_ROOT}/registry.json")
   fi
 
   local url="http://localhost:${port}"
+
+  if [ "$mode" = "auth" ]; then
+    if [ -z "$site_name" ] || [ -z "$bench_path" ]; then
+      log "WARNING: no site_name/path for '$name' in registry; opening plain URL" >&2
+    else
+      log "Minting an Administrator session for $site_name..."
+      local sid
+      sid="$(mint_admin_sid "$bench_path" "$site_name")"
+      if [ -n "$sid" ]; then
+        url="http://localhost:${port}/app?sid=${sid}"
+      else
+        log "WARNING: failed to mint sid (is the bench's Python env reachable?); opening plain URL" >&2
+      fi
+    fi
+  fi
+
   log "Opening $url"
   if command -v open >/dev/null 2>&1; then
     open "$url"

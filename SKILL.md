@@ -1310,6 +1310,7 @@ Configuration points you must set before using the templates:
 | `TASK_DESCRIPTION` | `"Test auth refactor before PR merge"` | Short description of why this bench was created |
 | `WORKSPACES_FILE` | `${BENCH_ROOT}/workspaces.json` | Declared, read-mostly app/branch/reference-bench manifest per workspace (§3.2.2). `mh new --workspace <name>` reads it; nothing in the provisioning path writes to it |
 | `MH_MAX_PERSISTENT` | `4` | Cap on `type: "persistent"` registry entries `mh reference create` will allow before refusing — a guard against reference-bench sprawl on a shared host (§3.2.2) |
+| `OPEN_MODE_FILE` | `${BENCH_ROOT}/.mh_open_mode` | Persisted machine-wide default for `mh open`'s URL mode (`auth` or `plain`, §9a.1). Written whenever `mh open --auth`/`--plain` is used; read on every plain `mh open <name>` |
 
 `audit.sh` reconciles registry vs reality and, for any orphaned or missing entries discovered, writes them to the workspace archive (`${BENCH_ROOT}/archive.json`) with `outcome: "orphaned"` before flagging them in the report.
 
@@ -1330,12 +1331,30 @@ The `examples/mh` script is a thin wrapper that provides quick commands for huma
 | `mh reference create <name> --workspace <workspace> [--blank] [--dry-run]` | Provision a new named, persistent reference bench for a workspace. |
 | `mh reference refresh <name> --from-backup <dir>` \| `--from-bench <other>` | Reseed an existing named reference bench from an external backup or another live bench's current data (§3.2.1/§3.2.2). |
 | `mh testplan <name> [--output <file>]` | Generate a test plan template for a bench. |
-| `mh open <name>` | Open the bench site in the default browser. |
+| `mh open <name> [--auth\|--plain]` | Open the bench site in the default browser. Defaults to an Administrator-authenticated URL (`?sid=...`, minted via `bench console login_as` — no password involved); `--auth`/`--plain` also persists that choice as the machine-wide default for future calls (§9a.1). |
 | `mh logs <name>` | Tail the bench logs. |
 | `mh teardown <name> [--dry-run]` | Remove a disposable bench (wraps `teardown.sh`). |
 | `mh audit [--fix] [--force-worktrees] [--json]` | Reconcile registry vs reality (wraps `audit.sh`). |
 | `mh status` | Quick status of benches (ports, processes). |
 | `mh doctor` | Check environment prerequisites. |
+
+### 9a.1 `mh open` and authenticated URLs
+
+`mh open <name>` mints a fresh Administrator `sid` via `bench console` +
+`login_as("Administrator")` (the same no-password trick as the headless
+session-auth reference) and opens `http://localhost:<port>/app?sid=<sid>`,
+rather than the bare unauthenticated URL. This is a live decision made on
+every call — the sid is short-lived and re-minted each time, not something
+`mh new`/`bench restart` needs to remember or regenerate for you.
+
+The mode is a single machine-wide setting, not a per-bench one: `--auth` or
+`--plain` on any `mh open` call overwrites `OPEN_MODE_FILE` (default
+`${BENCH_ROOT}/.mh_open_mode`) so every later `mh open <any-bench>` — after a
+`bench restart`, a fresh `mh new`, whatever — reuses the same choice without
+the flag. With no flag and no persisted file yet, it defaults to `auth` and
+writes that as the persisted default on first use. Falls back to a plain URL
+with a warning if the registry has no `site_name`/`path` for the bench, or if
+minting a session fails (e.g. the bench isn't up yet).
 
 ### Slash-command style triggers for agents
 
