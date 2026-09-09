@@ -29,6 +29,8 @@ APP_REPO="${APP_REPO:-}"
 SOURCE_REPO="${SOURCE_REPO:-}"
 APP_NAME="${APP_NAME:-}"
 FRAPPE_BRANCH="${FRAPPE_BRANCH:-version-15}"
+FRAMEWORK_SEED="${FRAMEWORK_SEED:-}"
+FRAMEWORK_SEED_ID="${FRAMEWORK_SEED_ID:-}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-admin}"
 SIGNED_BY="${SIGNED_BY:-${USER:-unknown}}"
 DRY_RUN=false
@@ -78,7 +80,7 @@ if [ -z "${REDIS_HOST:-}" ] && [ -f "${REFERENCE_BENCH_DIR}/sites/common_site_co
 fi
 
 usage() {
-  cat <<EOF
+  cat <<'EOF'
 Usage: $0 --name <bench-name> --branch <branch> --track-dir <track-dir> [options]
 
 Options:
@@ -120,6 +122,15 @@ Options:
                         steps a manifest can declare (e.g. `cd apps/ury &&
                         yarn install` for a yarn-workspaces monorepo app) —
                         see workspaces.json's post_install_commands.
+  --framework-seed <bench-path>
+                        Create this bench with `bench init --clone-from` using
+                        a verified, immutable framework seed. The seed is
+                        copied; it is never modified or mounted. Its
+                        dependency app revisions must match this bench's
+                        declared app matrix.
+  --framework-seed-id <id>
+                        Immutable identity/fingerprint of --framework-seed.
+                        Recorded in registry.json and BENCH_IDENTITY.md.
   --from-reference     Restore data from reference bench's latest backup
                         (this is the DEFAULT — this flag is a no-op kept for
                         explicitness/back-compat; use --blank to opt out)
@@ -211,6 +222,8 @@ while [ $# -gt 0 ]; do
     --app) APP="$2"; shift 2 ;;
     --extra-app) EXTRA_APPS+=("$2"); shift 2 ;;
     --run-after-install) POST_INSTALL_CMDS+=("$2"); shift 2 ;;
+    --framework-seed) FRAMEWORK_SEED="$2"; shift 2 ;;
+    --framework-seed-id) FRAMEWORK_SEED_ID="$2"; shift 2 ;;
     --from-reference) FROM_REFERENCE=true; shift ;;
     --blank) FROM_REFERENCE=false; shift ;;
     --reference-backup-dir) REFERENCE_BACKUP_DIR="$2"; FROM_REFERENCE=true; shift 2 ;;
@@ -225,6 +238,15 @@ done
 [ -z "$TRACK_DIR" ] && { echo "ERROR: --track-dir is required" >&2; usage; exit 1; }
 APP="${APP:-$APP_NAME}"
 [ -z "$APP" ] && { echo "ERROR: --app or APP_NAME is required" >&2; usage; exit 1; }
+
+if [ -n "$FRAMEWORK_SEED" ]; then
+  if [ ! -d "$FRAMEWORK_SEED" ] || [ ! -d "$FRAMEWORK_SEED/apps/frappe" ]; then
+    echo "ERROR: --framework-seed must be an existing Bench with apps/frappe: $FRAMEWORK_SEED" >&2
+    exit 1
+  fi
+  FRAMEWORK_SEED=$(abs_existing_dir "$FRAMEWORK_SEED")
+  [ -n "$FRAMEWORK_SEED_ID" ] || FRAMEWORK_SEED_ID="$(git -C "$FRAMEWORK_SEED/apps/frappe" rev-parse HEAD 2>/dev/null || echo unknown)"
+fi
 
 require_command git
 require_command jq
@@ -355,6 +377,7 @@ log "Provisioning bench '$NAME' (branch: $BRANCH, app: $APP, data: $([ "$FROM_RE
 log "  track: $TRACK_DIR"
 log "  worktree: $WORKTREE"
 log "  source: $SOURCE_REPO"
+[ -n "$FRAMEWORK_SEED" ] && log "  framework seed: $FRAMEWORK_SEED ($FRAMEWORK_SEED_ID)"
 
 if [ "$DRY_RUN" = false ]; then
   if jq -e --arg name "$NAME" '.benches[$name]' "$REGISTRY_FILE" >/dev/null 2>&1; then
@@ -405,6 +428,8 @@ if [ "$DRY_RUN" = false ]; then
        --arg track "$TRACK_DIR" \
        --arg source "$SOURCE_REPO" \
        --arg app "$APP" \
+       --arg seed "$FRAMEWORK_SEED" \
+       --arg seed_id "$FRAMEWORK_SEED_ID" \
        --argjson extra_apps "$EXTRA_APPS_JSON" \
        --arg signer "$SIGNED_BY" \
        --argjson web "$WEB_PORT" \
@@ -421,6 +446,7 @@ if [ "$DRY_RUN" = false ]; then
           worktree: $worktree, track_dir: $track, source_repo: $source,
           worktree_managed: true, app_name: $app,
           bench_app_checkout: ($path + "/apps/" + $app),
+          framework_seed: (if $seed == "" then null else {path: $seed, id: $seed_id} end),
           apps: ([{name: $app, role: "primary", branch: $branch, source: $source}] + $extra_apps),
           purpose: "Provisioned by provision.sh",
           ports: {webserver: $web, socketio: $sock, file_watcher: $watch},
@@ -475,7 +501,14 @@ fi
 if [ -d "$BENCH_DIR" ]; then
   log "Bench directory exists; reusing (idempotent)"
 else
-  dry bench init --frappe-branch "$FRAPPE_BRANCH" "$BENCH_DIR"
+  if [ -n "$FRAMEWORK_SEED" ]; then
+    # Bench's clone-from path copies repositories into a new bench directory.
+    # It does not share mutable files with the seed. Keep a fresh-framework
+    # fallback for diagnostics and incompatible app matrices.
+    dry bench init --clone-from "$FRAMEWORK_SEED" "$BENCH_DIR"
+  else
+    dry bench init --frappe-branch "$FRAPPE_BRANCH" "$BENCH_DIR"
+  fi
 fi
 
 # All bench subcommands below (pip install, set-config, new-site, ...) must
@@ -511,11 +544,19 @@ if [ -e "$APP_PATH" ] || [ -L "$APP_PATH" ]; then
     echo "ERROR: bench app path must be a normal Git checkout, not a symlink: $APP_PATH" >&2
     exit 1
   }
-  current_branch=$(git -C "$APP_PATH" branch --show-current 2>/dev/null || true)
-  [ "$current_branch" = "$BRANCH" ] || {
-    echo "ERROR: bench app checkout is on '$current_branch', expected '$BRANCH': $APP_PATH" >&2
-    exit 1
-  }
+  if [ -n "$FRAMEWORK_SEED" ]; then
+    # A seed contains its own baseline primary checkout. Materialize the
+    # requested branch in this copied checkout so runtime code remains
+    # independent from both the seed and the track worktree.
+    dry git -C "$APP_PATH" fetch --no-tags "$SOURCE_REPO" "$BRANCH"
+    dry git -C "$APP_PATH" checkout -B "$BRANCH" FETCH_HEAD
+  else
+    current_branch=$(git -C "$APP_PATH" branch --show-current 2>/dev/null || true)
+    [ "$current_branch" = "$BRANCH" ] || {
+      echo "ERROR: bench app checkout is on '$current_branch', expected '$BRANCH': $APP_PATH" >&2
+      exit 1
+    }
+  fi
 else
   dry git clone --branch "$BRANCH" --single-branch "$SOURCE_REPO" "$APP_PATH"
 
@@ -704,6 +745,25 @@ if [ "$DRY_RUN" = false ]; then
   jq --arg name "$NAME" '.benches[$name].status = "ready"' "$REGISTRY_FILE" > "$TMP"
   mv "$TMP" "$REGISTRY_FILE"
   flock -u 200
+
+  cat > "$BENCH_DIR/BENCH_IDENTITY.md" <<EOF
+# STOP — read before modifying
+
+This is a disposable bench provisioned by frappe-multihand.
+
+| Field | Value |
+| --- | --- |
+| Bench | $NAME |
+| Branch | $BRANCH |
+| Framework seed | ${FRAMEWORK_SEED:-fresh-framework} |
+| Seed identity | ${FRAMEWORK_SEED_ID:-n/a} |
+| Registry | $REGISTRY_FILE |
+| Site | $SITE_NAME |
+
+The seed is a source template only. This bench owns its writable site, database,
+Redis namespaces, ports, and app checkout. Use `mh audit` before recovery or
+`mh teardown $NAME` only after the owner has finished with the bench.
+EOF
 fi
 
 trap - ERR

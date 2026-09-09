@@ -15,6 +15,9 @@ Frappe development often needs isolated environments: one for a feature branch, 
 Creating a completely separate Docker stack for every branch is slow and wasteful. This skill defines a pragmatic middle ground:
 
 - One **reference bench** stays stable and is never mutated.
+- A workspace may declare a read-only **framework seed**. Seeded disposable benches use
+  `bench init --clone-from` to reuse the framework/dependency source baseline while retaining
+  their own writable app checkout, site, database, Redis namespaces, and ports.
 - Many **disposable benches** are created on demand, one per track worktree/branch/PR.
 - All benches share MariaDB and Redis containers, but each bench gets its own DB user, DB name, Redis DB index, and port tuple.
 - A small **registry** tracks every bench so nothing is orphaned.
@@ -49,6 +52,18 @@ The development worktree and running bench are deliberately different paths: the
 worktree under the track is where code is edited and committed; the bench
 contains a separate normal Git checkout of the selected branch. Uncommitted
 worktree changes do not silently change a running bench.
+
+## Workspace framework seeds
+
+Add `framework_seed: {path, id}` to a workspace in `workspaces.json`. The path must be a
+verified Bench containing `apps/frappe`; `id` should be an immutable build fingerprint. `mh new
+--workspace <name>` forwards that selection to provisioning. The resulting bench is a copy, not a
+mount or symlink: the seed remains untouched and every branch bench retains independent runtime
+state. Use the normal fresh-framework path when a branch needs an incompatible Frappe or
+dependency matrix.
+
+`bench init --clone-from` behaviour is Bench-version-dependent. Validate the actual Bench version
+and benchmark its source/env/build reuse before making seeded provisioning the default for a host.
 
 ### Slash commands for agents
 

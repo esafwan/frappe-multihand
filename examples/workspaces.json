@@ -3,6 +3,10 @@
 
   "ury": {
     "reference_bench": "reference",
+    "framework_seed": {
+      "path": "/opt/benches/ury-framework-v15",
+      "id": "replace-with-a-verified-frappe-erpnext-hrms-build-fingerprint"
+    },
     "apps": [
       {"name": "frappe", "role": "dependency", "branch": "version-15"},
       {"name": "erpnext", "role": "dependency", "branch": "version-15"},
@@ -29,6 +33,10 @@
 
   "huf": {
     "reference_bench": "reference-huf",
+    "framework_seed": {
+      "path": "/opt/benches/huf-framework-v15",
+      "id": "replace-with-a-verified-frappe-huf-build-fingerprint"
+    },
     "apps": [
       {"name": "frappe", "role": "dependency", "branch": "version-15"},
       {

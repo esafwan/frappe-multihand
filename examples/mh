@@ -189,6 +189,14 @@ resolve_workspace_args() {
     echo "__FRAPPE_BRANCH__=${frappe_branch}"
   fi
 
+  local framework_seed framework_seed_id
+  framework_seed=$(jq -r --arg w "$workspace" '.[$w].framework_seed.path // empty' "$WORKSPACES_FILE")
+  framework_seed_id=$(jq -r --arg w "$workspace" '.[$w].framework_seed.id // empty' "$WORKSPACES_FILE")
+  if [ -n "$framework_seed" ]; then
+    echo "__FRAMEWORK_SEED__=${framework_seed}"
+    [ -n "$framework_seed_id" ] && echo "__FRAMEWORK_SEED_ID__=${framework_seed_id}"
+  fi
+
   local ref_bench
   ref_bench=$(jq -r --arg w "$workspace" '.[$w].reference_bench // empty' "$WORKSPACES_FILE")
   if [ -n "$ref_bench" ]; then
@@ -211,6 +219,8 @@ _resolve_new_args() {
   NEW_ARGS=()
   NEW_REF=""
   NEW_FRAPPE_BRANCH=""
+  NEW_FRAMEWORK_SEED=""
+  NEW_FRAMEWORK_SEED_ID=""
 
   if [ $# -gt 0 ] && [[ "$1" != --* ]]; then
     NEW_ARGS+=(--name "$1")
@@ -240,6 +250,8 @@ _resolve_new_args() {
       case "$line" in
         __REFERENCE_BENCH_NAME__=*) NEW_REF="${line#__REFERENCE_BENCH_NAME__=}" ;;
         __FRAPPE_BRANCH__=*) NEW_FRAPPE_BRANCH="${line#__FRAPPE_BRANCH__=}" ;;
+        __FRAMEWORK_SEED__=*) NEW_FRAMEWORK_SEED="${line#__FRAMEWORK_SEED__=}" ;;
+        __FRAMEWORK_SEED_ID__=*) NEW_FRAMEWORK_SEED_ID="${line#__FRAMEWORK_SEED_ID__=}" ;;
         *) resolved+=("$line") ;;
       esac
     done < <(resolve_workspace_args "$workspace") || return 1
@@ -256,10 +268,12 @@ _resolve_new_args() {
 
 cmd_new() {
   require_script "$PROVISION_SCRIPT"
-  local NEW_ARGS=() NEW_REF="" NEW_FRAPPE_BRANCH=""
+  local NEW_ARGS=() NEW_REF="" NEW_FRAPPE_BRANCH="" NEW_FRAMEWORK_SEED="" NEW_FRAMEWORK_SEED_ID=""
   _resolve_new_args "$@" || exit 1
   [ -n "$NEW_REF" ] && export REFERENCE_BENCH_NAME="$NEW_REF"
   [ -n "$NEW_FRAPPE_BRANCH" ] && export FRAPPE_BRANCH="$NEW_FRAPPE_BRANCH"
+  [ -n "$NEW_FRAMEWORK_SEED" ] && export FRAMEWORK_SEED="$NEW_FRAMEWORK_SEED"
+  [ -n "$NEW_FRAMEWORK_SEED_ID" ] && export FRAMEWORK_SEED_ID="$NEW_FRAMEWORK_SEED_ID"
   exec "$PROVISION_SCRIPT" "${NEW_ARGS[@]}"
 }
 
@@ -569,7 +583,7 @@ cmd_reference_create() {
   # keep running after provision.sh returns.
   local create_argv=("$name" --workspace "$workspace" --track-dir "$track_dir" --blank)
   [ "$dry_run" = true ] && create_argv+=(--dry-run)
-  local NEW_ARGS=() NEW_REF="" NEW_FRAPPE_BRANCH=""
+  local NEW_ARGS=() NEW_REF="" NEW_FRAPPE_BRANCH="" NEW_FRAMEWORK_SEED="" NEW_FRAMEWORK_SEED_ID=""
   _resolve_new_args "${create_argv[@]}" || exit 1
   [ -n "$NEW_FRAPPE_BRANCH" ] && export FRAPPE_BRANCH="$NEW_FRAPPE_BRANCH"
   "$PROVISION_SCRIPT" "${NEW_ARGS[@]}"
@@ -746,6 +760,12 @@ cmd_doctor() {
             ok=false
           fi
         done
+        local seed
+        seed=$(jq -r --arg w "$ws" '.[$w].framework_seed.path // empty' "$WORKSPACES_FILE")
+        if [ -n "$seed" ] && [ ! -d "$seed/apps/frappe" ]; then
+          echo "    DRIFT: workspace '$ws' framework_seed is not a Bench with apps/frappe: $seed"
+          ok=false
+        fi
       done
     else
       echo "  workspaces.json: present but jq missing, cannot validate"
