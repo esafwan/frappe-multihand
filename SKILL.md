@@ -975,6 +975,31 @@ The archive is append-only and never purged by scripts. It gives the workspace a
 
 ## 6. Teardown and cleanup
 
+### 6.0 Ask before tearing down — do not auto-teardown after a test pass
+
+Never run `mh teardown` / `teardown.sh` immediately after provisioning and testing a bench unless
+the user has already said, in this conversation, to tear it down when done. A bench that was just
+used to validate a change is exactly the bench the user is most likely to want to poke at manually
+next — click through the UI, run one more `bench console` check, confirm something visually — and
+tearing it down the moment automated verification passes removes that option with no way back
+(the site, its data, and the app checkout are all deleted).
+
+Before calling teardown on a bench you provisioned this session:
+
+1. If the user has not asked for teardown yet, ask them explicitly — e.g. "Validation passed on
+   `<bench-name>` (`http://localhost:<port>`, admin/`<password>`). Want to poke at it yourself
+   first, or should I tear it down?" — and wait for their answer.
+2. Only proceed straight to teardown without asking if the user already said something like "tear
+   it down when you're done" or "just clean up after yourself" earlier in the same task.
+3. If a teardown call fires before the user's answer arrives (e.g. queued in the same turn as a
+   monitor/background check), treat that as a mistake to own up to, not silently proceed as if
+   nothing happened — tell the user it already ran and re-provision if they still want to test.
+
+This applies to disposable benches created for verification. It does not apply to benches the user
+explicitly asked you to build-and-discard as one shot (e.g. "spin up a bench, run the tests, tear
+it down" in a single instruction) — there, teardown following passing tests is exactly what was
+asked for.
+
 ### 6.1 Idempotent teardown
 
 Teardown must be safely re-runnable. Steps (in order):
@@ -1391,6 +1416,50 @@ Alternatives to reduce cost:
   behavior.
 
 Even with optimizations, each disposable bench should still have its own `sites/`, `env/`, ports, DB user, and Redis DB index.
+
+### 10.1 Monitoring a backgrounded `mh new` — never use a self-matching `pgrep -f` loop
+
+Because `bench init`/`bench get-app` can take several minutes (§10), it's tempting to
+background `mh new <bench-name> ...` and poll for completion with something like:
+
+```bash
+# BROKEN — do not use
+mh new huf-desk-portal-p1 --branch foo --track-dir bar &
+until ! pgrep -f "mh new huf-desk-portal-p1" >/dev/null; do sleep 10; done
+```
+
+This hangs **forever**, even after provisioning finishes successfully. `pgrep -f` matches
+against the full command line of *every* process, including the wait-loop's own shell —
+and that shell's command line contains the literal string `mh new huf-desk-portal-p1`
+inside its own `pgrep -f "..."` argument. The loop is matching itself (and it will also
+match any other stuck loop watching the same bench name), so `pgrep` never returns empty
+and the loop never exits. This is not hypothetical — it has been observed in production:
+loops left running 1+ hour after provisioning had long since completed, each falsely
+believing the process was still running.
+
+Use one of these instead:
+
+- **Preferred — capture the PID at launch time**, since you control how the command
+  starts:
+
+  ```bash
+  mh new huf-desk-portal-p1 --branch foo --track-dir bar &
+  PID=$!
+  wait "$PID"
+  echo "provisioning finished with exit code $?"
+  ```
+
+  `wait` blocks on the exact PID with no string matching at all, so it cannot self-match.
+
+- **If you didn't launch the process yourself** (so you have no PID to wait on) and must
+  poll by name, make the search pattern unable to match the poller's own invocation —
+  e.g. match a distinctive log file path the target writes to (`pgrep -f
+  "logs/huf-desk-portal-p1-provision.log"`) rather than the target's own argv, or record
+  the target's PID from `provision.sh`'s own output/PID file and poll `kill -0 "$PID"`
+  instead of `pgrep -f` at all.
+
+Never write a monitoring loop whose `pgrep -f` pattern is a substring of the loop's own
+command line.
 
 ---
 
